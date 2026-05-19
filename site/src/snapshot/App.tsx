@@ -1,0 +1,349 @@
+import { useEffect, useState } from 'react';
+import HarnessMatrix from '@/components/react/HarnessMatrix';
+import LeaderboardTable from '@/components/react/LeaderboardTable';
+import SliceAnalyzer from '@/components/react/SliceAnalyzer';
+import TaskExplorer from '@/components/react/TaskExplorer';
+import type { LeaderboardData, StatsData, TaskRecord } from '@/lib/types';
+
+type Locale = 'zh' | 'en';
+
+interface SnapshotData {
+  generatedAt: string;
+  stats: StatsData;
+  leaderboard: LeaderboardData;
+  tasks: TaskRecord[];
+  labels: Record<Locale, Record<string, unknown>>;
+}
+
+declare global {
+  interface Window {
+    __PAWBENCH__: SnapshotData;
+  }
+}
+
+const TABS: Array<{ id: 'leaderboard' | 'slice' | 'tasks'; key: string }> = [
+  { id: 'leaderboard', key: 'tab.leaderboard' },
+  { id: 'slice',       key: 'tab.slice' },
+  { id: 'tasks',       key: 'tab.tasks' },
+];
+
+function getLabel(L: Record<string, unknown>, key: string, fallback = ''): string {
+  const v = L[key];
+  return typeof v === 'string' ? v : fallback;
+}
+
+export default function App() {
+  const D = window.__PAWBENCH__;
+  const [locale, setLocale] = useState<Locale>('zh');
+  const [tab, setTab] = useState<'leaderboard' | 'slice' | 'tasks'>('leaderboard');
+  const [dark, setDark] = useState(false);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', dark);
+  }, [dark]);
+
+  // Sync tab + locale to URL hash so links can be shared.
+  useEffect(() => {
+    const m = /^#\/(zh|en)\/(leaderboard|slice|tasks)/.exec(window.location.hash);
+    if (m) {
+      setLocale(m[1] as Locale);
+      setTab(m[2] as 'leaderboard' | 'slice' | 'tasks');
+    }
+  }, []);
+  useEffect(() => {
+    const next = `#/${locale}/${tab}`;
+    if (window.location.hash !== next) {
+      window.history.replaceState({}, '', next);
+    }
+  }, [locale, tab]);
+
+  const L = D.labels[locale] as Record<string, unknown>;
+  const t = (k: string, fb = '') => getLabel(L, k, fb);
+
+  const matrixLabels = {
+    title: t('leaderboard.matrix.title'),
+    empty: t('leaderboard.matrix.empty'),
+    avg:   t('leaderboard.matrix.avg', 'Avg'),
+    delta: 'Δ',
+    none:  '—',
+  };
+
+  const tableLabels = {
+    rank:      t('leaderboard.col.rank', '#'),
+    model:     t('leaderboard.col.model', 'Model'),
+    harness:   t('leaderboard.col.harness', 'Harness'),
+    overall:   t('leaderboard.col.overall', 'Overall'),
+    automated: t('leaderboard.col.automated', 'Automated'),
+    judge:     t('leaderboard.col.judge', 'Judge'),
+    tasks:     t('leaderboard.col.tasks', 'Tasks'),
+    updated:   t('leaderboard.col.updated', 'Updated'),
+  };
+
+  const sliceLabels = {
+    dim: t('slice.dim'),
+    dims: {
+      complexity:    t('slice.dim.complexity'),
+      modality:      t('slice.dim.modality'),
+      channel:       t('slice.dim.channel'),
+      environment:   t('slice.dim.environment'),
+      capability:    t('slice.dim.capability'),
+      grading:       t('slice.dim.grading'),
+      source:        t('slice.dim.source'),
+      scenario_top:  t('slice.dim.scenario_top'),
+      scenario:      t('slice.dim.scenario'),
+      category:      t('slice.dim.category'),
+      subcategory:   t('slice.dim.subcategory'),
+      'group:task-shape': t('slice.group.shape'),
+      'group:capability': t('slice.group.capability'),
+      'group:scoring':    t('slice.group.scoring'),
+      'group:taxonomy':   t('slice.group.taxonomy'),
+      'bucket.title':     t('slice.bucket.title'),
+      'bucket.help':      t('slice.bucket.help'),
+      'pivot.summary':    t('slice.pivot.summary'),
+      'pivot.taskCount':  t('slice.pivot.taskCount'),
+      'pivot.bestCol':    t('slice.pivot.bestCol'),
+      noModelData:        t('slice.noModelData'),
+    },
+  };
+
+  const tasksLabels = {
+    search:     t('tasks.filter.search'),
+    source:     t('tasks.filter.source'),
+    complexity: t('tasks.filter.complexity'),
+    capability: t('tasks.filter.capability'),
+    modality:   t('tasks.filter.modality'),
+    grading:    t('tasks.filter.grading'),
+    reset:      t('tasks.filter.reset'),
+    empty:      t('tasks.empty'),
+    count:      t('tasks.count'),
+    modal: {
+      prompt:       t('tasks.modal.prompt'),
+      expected:     t('tasks.modal.expected'),
+      grading:      t('tasks.modal.grading'),
+      viewOnGitHub: t('tasks.modal.viewOnGitHub'),
+      close:        t('tasks.modal.close'),
+    },
+  };
+
+  return (
+    <div className="min-h-screen bg-white dark:bg-slate-950 text-slate-900 dark:text-slate-100">
+      <Topbar
+        locale={locale}
+        onLocale={setLocale}
+        dark={dark}
+        onDark={setDark}
+        title={t('site.title', 'pawbench')}
+        snapshotLabel={t('snapshot.badge', 'Snapshot')}
+        generatedAt={D.generatedAt}
+        tab={tab}
+        onTab={setTab}
+        tabLabels={TABS.map((tb) => ({ id: tb.id, label: t(tb.key, tb.id) }))}
+      />
+
+      {tab === 'leaderboard' && (
+        <Hero
+          tagline={t('site.tagline')}
+          description={t('site.description')}
+          stats={[
+            { value: D.stats.total, label: t('hero.stats.tasks', 'Tasks') },
+            { value: Object.keys(D.stats.sources || {}).length, label: t('hero.stats.sources', 'Sources') },
+            { value: (D.leaderboard.matrix?.harnesses?.length ?? 0), label: t('hero.stats.harnesses', 'Harnesses') },
+            { value: Object.keys(D.stats.capabilities || {}).length, label: t('hero.stats.capabilities', 'Capabilities') },
+          ]}
+        />
+      )}
+
+      <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 space-y-12">
+        {tab === 'leaderboard' && (
+          <>
+            <Section title={t('leaderboard.matrix.title')} subtitle={t('leaderboard.subtitle')}>
+              <HarnessMatrix data={D.leaderboard} labels={matrixLabels} />
+            </Section>
+            <Section title={t('leaderboard.title')} subtitle={t('leaderboard.subtitle')}>
+              <LeaderboardTable data={D.leaderboard} labels={tableLabels} />
+            </Section>
+          </>
+        )}
+
+        {tab === 'slice' && (
+          <Section title={t('slice.title')} subtitle={t('slice.subtitle')}>
+            <SliceAnalyzer data={D.leaderboard} stats={D.stats} labels={sliceLabels} />
+          </Section>
+        )}
+
+        {tab === 'tasks' && (
+          <Section title={t('tasks.title')} subtitle={t('tasks.subtitle')}>
+            <TaskExplorer tasks={D.tasks} baseUrl="" labels={tasksLabels} />
+          </Section>
+        )}
+      </main>
+
+      <Footer
+        builtBy={t('footer.builtBy', 'Maintained by AgentScope')}
+        license={t('footer.license', 'MIT License')}
+      />
+    </div>
+  );
+}
+
+function Topbar({
+  locale, onLocale, dark, onDark, title, snapshotLabel, generatedAt,
+  tab, onTab, tabLabels,
+}: {
+  locale: Locale;
+  onLocale: (l: Locale) => void;
+  dark: boolean;
+  onDark: (d: boolean) => void;
+  title: string;
+  snapshotLabel: string;
+  generatedAt: string;
+  tab: 'leaderboard' | 'slice' | 'tasks';
+  onTab: (t: 'leaderboard' | 'slice' | 'tasks') => void;
+  tabLabels: Array<{ id: 'leaderboard' | 'slice' | 'tasks'; label: string }>;
+}) {
+  return (
+    <header className="sticky top-0 z-30 backdrop-blur bg-white/80 dark:bg-slate-950/70 border-b border-slate-200 dark:border-slate-800">
+      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 h-14 flex items-center justify-between gap-4">
+        {/* Brand */}
+        <div className="flex items-center gap-2 min-w-0">
+          <span className="text-xl" aria-hidden="true">🐾</span>
+          <span className="font-semibold tracking-tight text-slate-900 dark:text-slate-100">{title}</span>
+          <span
+            className="hidden sm:inline-flex items-center text-[10px] uppercase tracking-wider px-1.5 py-0.5 rounded border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 text-amber-800 dark:text-amber-200"
+            title={`Generated ${generatedAt}`}
+          >
+            {snapshotLabel}
+          </span>
+        </div>
+
+        {/* Tabs (center, hidden on mobile, mobile gets a row below) */}
+        <nav className="hidden md:flex items-center gap-1 text-sm">
+          {tabLabels.map(({ id, label }) => {
+            const active = tab === id;
+            return (
+              <button
+                key={id}
+                type="button"
+                onClick={() => onTab(id)}
+                className={
+                  'px-3 py-1.5 rounded-md transition ' +
+                  (active
+                    ? 'text-brand-700 dark:text-brand-300 bg-brand-50 dark:bg-brand-950/40'
+                    : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100 dark:text-slate-300 dark:hover:text-white dark:hover:bg-slate-800')
+                }
+              >
+                {label}
+              </button>
+            );
+          })}
+        </nav>
+
+        {/* Right cluster */}
+        <div className="flex items-center gap-2 text-xs">
+          <button
+            type="button"
+            onClick={() => onLocale(locale === 'zh' ? 'en' : 'zh')}
+            className="px-2.5 py-1 rounded-md border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+            aria-label="Toggle language"
+          >
+            {locale === 'zh' ? 'EN' : '中文'}
+          </button>
+          <a
+            href="https://github.com/agentscope-ai/pawbench"
+            target="_blank"
+            rel="noopener"
+            className="px-2.5 py-1 rounded-md border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            GitHub
+          </a>
+          <button
+            type="button"
+            onClick={() => onDark(!dark)}
+            aria-label="Toggle theme"
+            className="p-1.5 rounded-md border border-slate-200 dark:border-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+          >
+            {dark ? (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" /></svg>
+            ) : (
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" /></svg>
+            )}
+          </button>
+        </div>
+      </div>
+
+      {/* Mobile tab row */}
+      <nav className="md:hidden border-t border-slate-200 dark:border-slate-800 px-2 flex gap-1 overflow-x-auto">
+        {tabLabels.map(({ id, label }) => {
+          const active = tab === id;
+          return (
+            <button
+              key={id}
+              type="button"
+              onClick={() => onTab(id)}
+              className={
+                'px-3 py-2 text-sm font-medium border-b-2 transition whitespace-nowrap ' +
+                (active
+                  ? 'border-brand-700 text-brand-800 dark:text-brand-200'
+                  : 'border-transparent text-slate-500')
+              }
+            >
+              {label}
+            </button>
+          );
+        })}
+      </nav>
+    </header>
+  );
+}
+
+function Hero({
+  tagline, description, stats,
+}: {
+  tagline: string;
+  description: string;
+  stats: Array<{ value: string | number; label: string }>;
+}) {
+  return (
+    <section className="relative overflow-hidden border-b border-slate-200 dark:border-slate-800 bg-gradient-to-br from-brand-50 via-white to-white dark:from-brand-950/40 dark:via-slate-950 dark:to-slate-950">
+      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-10 sm:py-14">
+        <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-slate-900 dark:text-white">
+          {tagline}
+        </h1>
+        <p className="mt-3 max-w-3xl text-sm sm:text-base text-slate-600 dark:text-slate-400">
+          {description}
+        </p>
+        <div className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-3 max-w-2xl">
+          {stats.map((s) => (
+            <div key={s.label} className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/40 px-3 py-2">
+              <div className="text-2xl font-bold tabular-nums text-brand-700 dark:text-brand-300">{s.value}</div>
+              <div className="text-xs text-slate-500 mt-0.5">{s.label}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </section>
+  );
+}
+
+function Section({ title, subtitle, children }: { title: string; subtitle?: string; children: React.ReactNode }) {
+  return (
+    <section>
+      <h2 className="text-2xl font-bold text-slate-900 dark:text-white">{title}</h2>
+      {subtitle && <p className="mt-1 text-sm text-slate-500">{subtitle}</p>}
+      <div className="mt-4">{children}</div>
+    </section>
+  );
+}
+
+function Footer({ builtBy, license }: { builtBy: string; license: string }) {
+  return (
+    <footer className="border-t border-slate-200 dark:border-slate-800 mt-12">
+      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-6 text-xs text-slate-500 flex flex-wrap items-center justify-between gap-3">
+        <div>{builtBy} · {license}</div>
+        <div className="text-slate-400">
+          Generated as a self-contained HTML snapshot · open by double-click
+        </div>
+      </div>
+    </footer>
+  );
+}

@@ -1,0 +1,22 @@
+---
+import Base from '@/layouts/Base.astro';
+import TaskDetail from '@/components/astro/TaskDetail.astro';
+import { type Locale, t } from '@/i18n';
+import type { TaskRecord } from '@/lib/types';
+
+export async function getStaticPaths() {
+  const tasks = (await import('@/data/tasks.json')).default as TaskRecord[];
+  return tasks.map((task) => ({
+    params: { id: task.t_id },
+    props:  { task },
+  }));
+}
+
+interface P { task: TaskRecord }
+const { task } = Astro.props as P;
+const locale: Locale = 'en';
+---
+
+<Base locale={locale} title={task.name}>
+  <TaskDetail task={task} locale={locale} />
+</Base>

@@ -1,0 +1,62 @@
+---
+import { type Locale, t } from '@/i18n';
+
+interface Props { locale: Locale }
+const { locale } = Astro.props;
+
+const bibtex = `@misc{pawbench2026,
+  title  = {pawbench: An open benchmark for evaluating AI agents on real-world tasks},
+  author = {The AgentScope Team},
+  year   = {2026},
+  url    = {https://agentscope-ai.github.io/pawbench/},
+  note   = {150 tasks across 6 source datasets and 3 agent harnesses}
+}`;
+
+const copyLabel   = t(locale, 'cite.copy');
+const copiedLabel = t(locale, 'cite.copied');
+---
+
+<section>
+  <h2 class="text-2xl font-bold text-slate-900 dark:text-white">{t(locale, 'cite.title')}</h2>
+  <p class="mt-1 text-sm text-slate-500">{t(locale, 'cite.subtitle')}</p>
+
+  <div class="relative mt-4 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-900/60">
+    <button
+      type="button"
+      class="absolute top-3 right-3 px-2.5 py-1 rounded-md text-xs border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 text-slate-600 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800"
+      data-copy-bibtex
+      data-copy-label={copyLabel}
+      data-copied-label={copiedLabel}
+    >
+      {copyLabel}
+    </button>
+    <pre class="text-xs leading-relaxed p-4 pr-20 overflow-x-auto text-slate-700 dark:text-slate-200 font-mono whitespace-pre"><code id="pawbench-bibtex">{bibtex}</code></pre>
+  </div>
+</section>
+
+<script is:inline>
+  document.addEventListener('click', (e) => {
+    const target = e.target;
+    if (!(target instanceof HTMLElement)) return;
+    const btn = target.closest('[data-copy-bibtex]');
+    if (!btn) return;
+    const code = document.getElementById('pawbench-bibtex');
+    if (!code) return;
+    const text = code.textContent || '';
+    const original = btn.getAttribute('data-copy-label') || 'Copy';
+    const copied   = btn.getAttribute('data-copied-label') || 'Copied';
+    const finish = () => {
+      btn.textContent = copied;
+      setTimeout(() => { btn.textContent = original; }, 1400);
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(finish).catch(finish);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = text; document.body.appendChild(ta); ta.select();
+      try { document.execCommand('copy'); } catch {}
+      document.body.removeChild(ta);
+      finish();
+    }
+  });
+</script>

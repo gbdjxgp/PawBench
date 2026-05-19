@@ -1,0 +1,204 @@
+---
+import { type Locale, t, localizedPath } from '@/i18n';
+import { complexityBadgeClass } from '@/lib/utils';
+import { renderTaskMarkdown } from '@/lib/markdown';
+import type { TaskRecord } from '@/lib/types';
+import Pair from '@/components/astro/Pair.astro';
+
+interface Props {
+  task: TaskRecord;
+  locale: Locale;
+}
+
+const { task, locale } = Astro.props;
+
+const ghBlobUrl = `https://github.com/agentscope-ai/pawbench/blob/main/${task.source_path}`;
+
+const meta = task.labels;
+const cw = task.workspace_files || [];
+const sections = task.sections || {};
+
+const promptHtml   = sections.prompt           ? await renderTaskMarkdown(sections.prompt)           : '';
+const expectedHtml = sections.expected         ? await renderTaskMarkdown(sections.expected)         : '';
+const autoHtml     = sections.automated_checks ? await renderTaskMarkdown(sections.automated_checks) : '';
+const rubricHtml   = sections.rubric           ? await renderTaskMarkdown(sections.rubric)           : '';
+
+const modalityLabel = `${meta.modality?.type || 'text'}${(meta.modality?.channels?.length ?? 0) ? ` · ${meta.modality.channels.join(', ')}` : ''}`;
+const weights = task.grading_weights || {};
+const hasWeights = (weights.automated != null || weights.llm_judge != null);
+const weightsLabel = hasWeights
+  ? `auto ${weights.automated ?? '?'} / judge ${weights.llm_judge ?? '?'}`
+  : null;
+---
+
+<article class="mx-auto max-w-3xl px-4 sm:px-6 lg:px-8 py-10 space-y-6">
+  <a
+    href={localizedPath(locale, '/tasks')}
+    class="text-sm text-brand-700 dark:text-brand-300 hover:underline inline-flex items-center gap-1"
+  >
+    ← {t(locale, 'task.back')}
+  </a>
+
+  <header class="space-y-3">
+    <div class="flex flex-wrap items-center gap-1.5 text-xs">
+      <span class="font-mono text-slate-500">{task.t_id}</span>
+      {meta.complexity && (
+        <span class={complexityBadgeClass(meta.complexity)}>{meta.complexity}</span>
+      )}
+      {task.source_dataset && <span class="badge badge-source">{task.source_dataset}</span>}
+      {task.grading_type && (
+        <span class="badge bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+          {task.grading_type}
+        </span>
+      )}
+      <span class="badge bg-slate-100 dark:bg-slate-800 text-slate-700 dark:text-slate-300">
+        {modalityLabel}
+      </span>
+      {(meta.capabilities || []).slice(0, 4).map((c) => (
+        <span class="badge bg-brand-50 dark:bg-brand-950/40 text-brand-800 dark:text-brand-200 border border-brand-100 dark:border-brand-900">
+          {c.replace(/_/g, ' ')}
+        </span>
+      ))}
+      {(meta.capabilities || []).length > 4 && (
+        <span class="text-[10px] text-slate-500">+{meta.capabilities.length - 4}</span>
+      )}
+    </div>
+    <h1 class="text-2xl sm:text-3xl font-bold text-slate-900 dark:text-white">{task.name}</h1>
+    <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
+      <span class="font-mono">{task.task_id}</span>
+      {meta.scenario && <span>· {meta.scenario}</span>}
+      {task.timeout_seconds && <span>· {task.timeout_seconds}s timeout</span>}
+      {weightsLabel && <span>· {weightsLabel}</span>}
+    </div>
+  </header>
+
+  {promptHtml && (
+    <section>
+      <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-500 mb-3">
+        {t(locale, 'task.section.prompt')}
+      </h2>
+      <div class="prose prose-slate dark:prose-invert max-w-none prose-pre:my-2 prose-headings:mt-4 prose-headings:mb-2" set:html={promptHtml} />
+    </section>
+  )}
+
+  {expectedHtml && (
+    <section>
+      <h2 class="text-sm font-semibold uppercase tracking-wide text-slate-500 mb-3">
+        {t(locale, 'task.section.expected')}
+      </h2>
+      <div class="prose prose-slate dark:prose-invert max-w-none prose-headings:mt-4 prose-headings:mb-2" set:html={expectedHtml} />
+    </section>
+  )}
+
+  {autoHtml && (
+    <details class="group rounded-xl border border-slate-200 dark:border-slate-800">
+      <summary class="cursor-pointer list-none px-4 py-3 flex items-center justify-between text-sm font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-900/40 rounded-xl">
+        <span class="uppercase tracking-wide text-xs text-slate-500 group-open:text-brand-700 dark:group-open:text-brand-300">
+          {t(locale, 'task.section.automated')}
+        </span>
+        <span class="text-slate-400 group-open:rotate-90 transition-transform">▸</span>
+      </summary>
+      <div class="px-4 pb-4 prose prose-slate dark:prose-invert max-w-none prose-pre:my-2 prose-headings:mt-4 prose-headings:mb-2" set:html={autoHtml} />
+    </details>
+  )}
+
+  {rubricHtml && (
+    <details class="group rounded-xl border border-slate-200 dark:border-slate-800">
+      <summary class="cursor-pointer list-none px-4 py-3 flex items-center justify-between text-sm font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-900/40 rounded-xl">
+        <span class="uppercase tracking-wide text-xs text-slate-500 group-open:text-brand-700 dark:group-open:text-brand-300">
+          {t(locale, 'task.section.rubric')}
+        </span>
+        <span class="text-slate-400 group-open:rotate-90 transition-transform">▸</span>
+      </summary>
+      <div class="px-4 pb-4 prose prose-slate dark:prose-invert max-w-none prose-headings:mt-4 prose-headings:mb-2" set:html={rubricHtml} />
+    </details>
+  )}
+
+  {cw.length > 0 && (
+    <details class="group rounded-xl border border-slate-200 dark:border-slate-800">
+      <summary class="cursor-pointer list-none px-4 py-3 flex items-center justify-between text-sm font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-900/40 rounded-xl">
+        <span class="uppercase tracking-wide text-xs text-slate-500 group-open:text-brand-700 dark:group-open:text-brand-300">
+          {t(locale, 'task.section.workspace', { count: cw.length })}
+        </span>
+        <span class="text-slate-400 group-open:rotate-90 transition-transform">▸</span>
+      </summary>
+      <ul class="px-4 pb-4 text-xs font-mono space-y-1">
+        {cw.map((f) => (
+          <li class="flex items-center gap-2 text-slate-600 dark:text-slate-300">
+            <span class="text-slate-400 truncate flex-1">{f.source}</span>
+            <span class="text-slate-300">→</span>
+            <span class="text-slate-700 dark:text-slate-200 truncate flex-1 text-right">{f.dest}</span>
+          </li>
+        ))}
+      </ul>
+    </details>
+  )}
+
+  {(meta.scenario || task.category || task.subcategory || meta.environment || hasWeights) && (
+    <details class="group rounded-xl border border-slate-200 dark:border-slate-800">
+      <summary class="cursor-pointer list-none px-4 py-3 flex items-center justify-between text-sm font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-900/40 rounded-xl">
+        <span class="uppercase tracking-wide text-xs text-slate-500 group-open:text-brand-700 dark:group-open:text-brand-300">
+          {t(locale, 'task.section.metadata')}
+        </span>
+        <span class="text-slate-400 group-open:rotate-90 transition-transform">▸</span>
+      </summary>
+      <dl class="px-4 pb-4 grid grid-cols-1 sm:grid-cols-2 gap-x-6 gap-y-2 text-sm">
+        {meta.scenario && <Pair label={t(locale, 'task.field.scenario')} value={meta.scenario} />}
+        {task.category && <Pair label={t(locale, 'task.field.category')} value={task.category} />}
+        {task.subcategory && <Pair label={t(locale, 'task.field.subcategory')} value={task.subcategory} />}
+        {meta.environment && <Pair label={t(locale, 'task.field.environment')} value={meta.environment} />}
+        {task.timeout_seconds && <Pair label={t(locale, 'task.field.timeout')} value={`${task.timeout_seconds}s`} />}
+        {weightsLabel && <Pair label={t(locale, 'task.field.weights')} value={weightsLabel} />}
+        <Pair label={t(locale, 'task.field.id')} value={task.task_id} mono />
+      </dl>
+    </details>
+  )}
+
+  <div class="pt-2">
+    <a
+      href={ghBlobUrl}
+      target="_blank"
+      rel="noopener"
+      class="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md border border-slate-200 dark:border-slate-700 text-xs text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800"
+    >
+      {t(locale, 'task.viewOnGitHub')} →
+    </a>
+  </div>
+</article>
+
+<style is:global>
+  .prose code { background: rgba(15,118,110,.10); padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.9em; }
+  html.dark .prose code { background: rgba(45,212,191,.12); }
+  .prose pre code { background: transparent; padding: 0; }
+
+  .shiki, .shiki span { font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace; }
+  .shiki {
+    border-radius: 0.5rem;
+    padding: 1rem;
+    overflow-x: auto;
+    font-size: 0.8rem;
+    line-height: 1.55;
+    border: 1px solid rgb(226 232 240);
+  }
+  html.dark .shiki { border-color: rgb(30 41 59); }
+  html.dark .shiki,
+  html.dark .shiki span {
+    color: var(--shiki-dark) !important;
+    background-color: var(--shiki-dark-bg) !important;
+    font-style: var(--shiki-dark-font-style) !important;
+    font-weight: var(--shiki-dark-font-weight) !important;
+    text-decoration: var(--shiki-dark-text-decoration) !important;
+  }
+  .shiki-fallback {
+    background-color: rgb(15 23 42);
+    color: rgb(226 232 240);
+    padding: 1rem;
+    border-radius: 0.5rem;
+    font-size: 0.8rem;
+    overflow-x: auto;
+  }
+
+  /* Hide the default disclosure triangle so the chevron is the only marker. */
+  details > summary { list-style: none; }
+  details > summary::-webkit-details-marker { display: none; }
+</style>

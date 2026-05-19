@@ -1,0 +1,12 @@
+---
+interface Props {
+  label: string;
+  value: string;
+  mono?: boolean;
+}
+const { label, value, mono } = Astro.props;
+---
+<div class="px-4 py-2 grid grid-cols-3 gap-2">
+  <div class="col-span-1 text-xs uppercase tracking-wide text-slate-400 self-center">{label}</div>
+  <div class={`col-span-2 ${mono ? 'font-mono text-xs' : 'text-sm'} text-slate-700 dark:text-slate-200 break-all`}>{value}</div>
+</div>

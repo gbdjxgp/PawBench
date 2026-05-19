@@ -1,0 +1,51 @@
+---
+import Base from '@/layouts/Base.astro';
+import { type Locale, t, localizedPath } from '@/i18n';
+import { getCollection } from 'astro:content';
+
+const locale: Locale = 'en';
+
+const posts = (await getCollection('blog'))
+  .filter((p) => p.data.locale === locale && !p.data.draft)
+  .sort((a, b) => +b.data.pubDate - +a.data.pubDate);
+
+const dateFmt = new Intl.DateTimeFormat('en-US', {
+  year: 'numeric', month: 'short', day: 'numeric',
+});
+
+function slugFor(id: string): string {
+  return id.replace(/^(zh|en)\//, '');
+}
+---
+
+<Base locale={locale} title={t(locale, 'blog.title')}>
+  <section class="mx-auto max-w-3xl px-4 sm:px-6 lg:px-8 py-16">
+    <h1 class="text-3xl font-bold text-slate-900 dark:text-white">{t(locale, 'blog.title')}</h1>
+    <p class="mt-2 text-sm text-slate-500 dark:text-slate-400">{t(locale, 'blog.subtitle')}</p>
+
+    {posts.length === 0 ? (
+      <div class="mt-12 rounded-xl border border-dashed border-slate-300 dark:border-slate-700 px-6 py-16 text-center text-slate-500">
+        {t(locale, 'blog.empty')}
+      </div>
+    ) : (
+      <ul class="mt-10 space-y-6">
+        {posts.map((p) => (
+          <li class="rounded-xl border border-slate-200 dark:border-slate-800 p-5 hover:border-brand-500 dark:hover:border-brand-500 transition">
+            <a href={localizedPath(locale, `/blog/${slugFor(p.id)}`)} class="block">
+              <div class="text-xs text-slate-500 mb-1.5">{dateFmt.format(p.data.pubDate)} · {p.data.author}</div>
+              <h2 class="text-lg font-semibold text-slate-900 dark:text-white">{p.data.title}</h2>
+              <p class="mt-1 text-sm text-slate-600 dark:text-slate-300">{p.data.description}</p>
+              {p.data.tags?.length > 0 && (
+                <div class="mt-2 flex flex-wrap gap-1">
+                  {p.data.tags.map((tag) => (
+                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-400">{tag}</span>
+                  ))}
+                </div>
+              )}
+            </a>
+          </li>
+        ))}
+      </ul>
+    )}
+  </section>
+</Base>

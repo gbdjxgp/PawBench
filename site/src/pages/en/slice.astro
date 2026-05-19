@@ -1,0 +1,50 @@
+---
+import Base from '@/layouts/Base.astro';
+import SliceAnalyzer from '@/components/react/SliceAnalyzer.tsx';
+import leaderboardJson from '@/data/leaderboard.json';
+import statsJson from '@/data/stats.json';
+import { type Locale, t } from '@/i18n';
+import type { LeaderboardData, StatsData } from '@/lib/types';
+
+const locale: Locale = 'en';
+const data = leaderboardJson as LeaderboardData;
+const stats = statsJson as StatsData;
+
+const labels = {
+  dim: t(locale, 'slice.dim'),
+  dims: {
+    complexity:    t(locale, 'slice.dim.complexity'),
+    modality:      t(locale, 'slice.dim.modality'),
+    channel:       t(locale, 'slice.dim.channel'),
+    environment:   t(locale, 'slice.dim.environment'),
+    capability:    t(locale, 'slice.dim.capability'),
+    grading:       t(locale, 'slice.dim.grading'),
+    source:        t(locale, 'slice.dim.source'),
+    scenario_top:  t(locale, 'slice.dim.scenario_top'),
+    scenario:      t(locale, 'slice.dim.scenario'),
+    category:      t(locale, 'slice.dim.category'),
+    subcategory:   t(locale, 'slice.dim.subcategory'),
+    'group:task-shape': t(locale, 'slice.group.shape'),
+    'group:capability': t(locale, 'slice.group.capability'),
+    'group:scoring':    t(locale, 'slice.group.scoring'),
+    'group:taxonomy':   t(locale, 'slice.group.taxonomy'),
+
+    'bucket.title':    t(locale, 'slice.bucket.title'),
+    'bucket.help':     t(locale, 'slice.bucket.help'),
+    'pivot.summary':   t(locale, 'slice.pivot.summary'),
+    'pivot.taskCount': t(locale, 'slice.pivot.taskCount'),
+    'pivot.bestCol':   t(locale, 'slice.pivot.bestCol'),
+    noModelData:       t(locale, 'slice.noModelData'),
+  },
+};
+---
+
+<Base locale={locale} title={t(locale, 'slice.title')}>
+  <section class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-12">
+    <h1 class="text-3xl font-bold text-slate-900 dark:text-white">{t(locale, 'slice.title')}</h1>
+    <p class="mt-2 text-sm text-slate-500 dark:text-slate-400">{t(locale, 'slice.subtitle')}</p>
+    <div class="mt-6">
+      <SliceAnalyzer client:load data={data} stats={stats} labels={labels} />
+    </div>
+  </section>
+</Base>

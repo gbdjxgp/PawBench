@@ -1,0 +1,31 @@
+---
+import { type Locale, t } from '@/i18n';
+
+interface Props { locale: Locale }
+const { locale } = Astro.props;
+
+const steps = [
+  { n: 1, key: 'howItWorks.step1' },
+  { n: 2, key: 'howItWorks.step2' },
+  { n: 3, key: 'howItWorks.step3' },
+];
+---
+
+<section>
+  <h2 class="text-2xl font-bold text-slate-900 dark:text-white">{t(locale, 'howItWorks.title')}</h2>
+  <p class="mt-1 text-sm text-slate-500">{t(locale, 'howItWorks.subtitle')}</p>
+
+  <ol class="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
+    {steps.map((s) => (
+      <li class="relative rounded-xl border border-slate-200 dark:border-slate-800 p-5 bg-white dark:bg-slate-900/40">
+        <div class="absolute -top-3 left-5 h-6 w-6 rounded-full bg-brand-700 text-white text-xs font-bold flex items-center justify-center">
+          {s.n}
+        </div>
+        <h3 class="mt-2 font-semibold text-slate-900 dark:text-white">{t(locale, `${s.key}.title`)}</h3>
+        <p class="mt-1.5 text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
+          {t(locale, `${s.key}.desc`)}
+        </p>
+      </li>
+    ))}
+  </ol>
+</section>

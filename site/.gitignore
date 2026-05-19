@@ -1,0 +1,24 @@
+# build output
+dist/
+.astro/
+
+# deps
+node_modules/
+
+# env
+.env
+.env.production
+
+# logs
+npm-debug.log*
+
+# generated data (rebuilt at every CI run)
+src/data/tasks.json
+src/data/leaderboard.json
+src/data/stats.json
+
+# snapshot tmp
+.snapshot-tmp/
+
+# misc
+.DS_Store

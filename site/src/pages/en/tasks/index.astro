@@ -1,0 +1,64 @@
+---
+import Base from '@/layouts/Base.astro';
+import TaskExplorer from '@/components/react/TaskExplorer.tsx';
+import tasksJson from '@/data/tasks.json';
+import { type Locale, t } from '@/i18n';
+import type { TaskRecord } from '@/lib/types';
+
+const locale: Locale = 'en';
+const tasks = tasksJson as unknown as TaskRecord[];
+
+const labels = {
+  search:     t(locale, 'tasks.filter.search'),
+  source:     t(locale, 'tasks.filter.source'),
+  complexity: t(locale, 'tasks.filter.complexity'),
+  capability: t(locale, 'tasks.filter.capability'),
+  modality:   t(locale, 'tasks.filter.modality'),
+  grading:    t(locale, 'tasks.filter.grading'),
+  reset:      t(locale, 'tasks.filter.reset'),
+  empty:      t(locale, 'tasks.empty'),
+  count:      t(locale, 'tasks.count'),
+  modal: {
+    prompt:       t(locale, 'tasks.modal.prompt'),
+    expected:     t(locale, 'tasks.modal.expected'),
+    grading:      t(locale, 'tasks.modal.grading'),
+    viewOnGitHub: t(locale, 'tasks.modal.viewOnGitHub'),
+    close:        t(locale, 'tasks.modal.close'),
+  },
+};
+---
+
+<Base locale={locale} title={t(locale, 'tasks.title')}>
+  <section class="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-12">
+    <h1 class="text-3xl font-bold text-slate-900 dark:text-white">{t(locale, 'tasks.title')}</h1>
+    <p class="mt-2 text-sm text-slate-500 dark:text-slate-400">{t(locale, 'tasks.subtitle')}</p>
+    <div class="mt-8">
+      <TaskExplorer
+        client:load
+        tasks={tasks}
+        baseUrl={import.meta.env.BASE_URL}
+        labels={labels}
+      />
+    </div>
+  </section>
+</Base>
+
+<style is:global>
+  .md-body p     { margin: 0 0 0.6em; line-height: 1.6; }
+  .md-body p:last-child { margin-bottom: 0; }
+  .md-body h2    { font-size: 1rem; font-weight: 600; margin: 1em 0 0.4em; }
+  .md-body h3    { font-size: 0.95rem; font-weight: 600; margin: 0.9em 0 0.35em; color: rgb(51 65 85); }
+  html.dark .md-body h3 { color: rgb(203 213 225); }
+  .md-body h4    { font-size: 0.85rem; font-weight: 600; margin: 0.8em 0 0.3em; color: rgb(71 85 105); }
+  html.dark .md-body h4 { color: rgb(148 163 184); }
+  .md-body ul, .md-body ol { padding-left: 1.4em; margin: 0 0 0.6em; }
+  .md-body ul    { list-style: disc; }
+  .md-body ol    { list-style: decimal; }
+  .md-body li    { margin: 0.2em 0; }
+  .md-body code  { background: rgba(15,118,110,.10); padding: 0.1em 0.35em; border-radius: 4px; font-size: 0.85em; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+  html.dark .md-body code { background: rgba(45,212,191,.15); }
+  .md-body pre.md-code { background: rgb(15 23 42); color: rgb(226 232 240); border-radius: 0.5rem; padding: 0.8rem 1rem; overflow-x: auto; font-size: 0.78rem; line-height: 1.55; margin: 0.6em 0; }
+  .md-body pre.md-code code { background: transparent; padding: 0; color: inherit; font-size: inherit; }
+  .md-body strong { font-weight: 600; color: rgb(15 23 42); }
+  html.dark .md-body strong { color: rgb(241 245 249); }
+</style>
