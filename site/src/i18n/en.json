@@ -1,7 +1,8 @@
 {
   "site.title": "pawbench",
-  "site.tagline": "An open benchmark for evaluating AI agents on real-world tasks",
-  "site.description": "pawbench covers 150 tasks across 6 source datasets and 3 agent harnesses, spanning communication, scheduling, data analysis, software engineering, and safety alignment.",
+  "site.tagline": "How (Model × Harness) combinations perform on production-grade tasks",
+  "site.description": "The same 150 tasks across (Model × Harness) combinations — read each axis independently and separate the model's contribution from the harness's.",
+  "hero.formula": "Agent Performance = f(Model, Harness)",
 
   "nav.leaderboard": "Leaderboard",
   "nav.slice": "Slice",

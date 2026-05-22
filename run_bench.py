@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+pawbench runner  ·  unified entry point for running pawbench tasks
+
+Quick start
+-----------
+
+  # Run all tasks with the copaw agent (default):
+  python run_bench.py --model openai/gpt-4o
+
+  # Run with OpenClaw agent (copawbench-openclaw:latest):
+  python run_bench.py --agents openclaw --model dashscope/qwen3.6-plus
+
+  # Run with Hermes agent (hermes-qwenclawbench:latest):
+  python run_bench.py --agents hermes --model dashscope/qwen3.6-plus
+
+  # Compare all three agents on the same tasks:
+  python run_bench.py --agents copaw openclaw hermes --model dashscope/qwen3.6-plus --tasks T002_email_triage
+
+  # Run only the wildclaw-converted dataset:
+  python run_bench.py --dataset wildclaw-converted --model openai/gpt-4o
+
+  # Run a specific subset of tasks:
+  python run_bench.py --model openai/gpt-4o --tasks T006_email_reply_draft T002_email_triage
+
+  # Run with a custom benchmark path:
+  python run_bench.py --benchmark-path /my/pawbench --model openai/gpt-4o
+
+  # Run multiple models sequentially:
+  python run_bench.py --model openai/gpt-4o --model anthropic/claude-sonnet-4-6
+
+  # Enable verbose output:
+  python run_bench.py --model openai/gpt-4o --verbose
+
+  Results are written under
+  ``./results/<YYYYMMDD_HHMMSS>/pawbench/<model>/<agent>/``
+  so all agents/models from the same invocation share a single run folder and repeated runs do not
+  overwrite each other. Use ``--no-results-version-path`` to omit the timestamp prefix (re-runs
+  overwrite previous results).
+
+Environment variables
+---------------------
+  OPENAI_MODEL      Fallback model when --model is not specified
+  OPENAI_API_KEY    API key (overridden by --api-key)
+  OPENAI_BASE_URL   Base URL (overridden by --base-url)
+  JUDGE_API_KEY     API key for the LLM judge (defaults to OPENAI_API_KEY)
+  JUDGE_BASE_URL    Base URL for the LLM judge (defaults to OPENAI_BASE_URL)
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import sys
+from datetime import datetime
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent))
+
+from pawbench import BenchmarkRunner, PawBenchBackend
+
+_SCRIPT_DIR = Path(__file__).parent
+_DEFAULT_BENCHMARK_PATH = _SCRIPT_DIR / "benchmarks" / "pawbench"
+_BENCHMARK_NAME = "pawbench"
+
+
+# ── argument parsing ───────────────────────────────────────────────────────────
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="pawbench — AI agent benchmark runner",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=__doc__,
+    )
+
+    bench_grp = p.add_argument_group("Benchmark selection")
+    bench_grp.add_argument(
+        "--benchmark-path",
+        type=Path,
+        default=None,
+        metavar="DIR",
+        help=f"Root directory of the benchmark data (default: {_DEFAULT_BENCHMARK_PATH}).",
+    )
+    bench_grp.add_argument(
+        "--dataset",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Dataset name inside <benchmark_path>/data/. "
+            "Default: claw-eval-converted. "
+            "Also available: wildclaw-converted."
+        ),
+    )
+
+    run_grp = p.add_argument_group("Task & agent selection")
+    run_grp.add_argument(
+        "--agents",
+        nargs="+",
+        choices=["copaw", "openclaw", "hermes"],
+        default=None,
+        help=(
+            "Agent(s) to use. Can be specified multiple times to run all agents sequentially. "
+            "'copaw' (default, qwenclawbench-copaw:latest), "
+            "'openclaw' (openclaw-pawbench:latest), "
+            "'hermes' (hermes-qwenclawbench:latest)."
+        ),
+    )
+    run_grp.add_argument(
+        "--tasks",
+        nargs="+",
+        metavar="TASK_ID",
+        help="Task IDs to run (default: all tasks in the dataset).",
+    )
+
+    exec_grp = p.add_argument_group("Execution options")
+    exec_grp.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Number of tasks to run in parallel (default: 1).",
+    )
+    exec_grp.add_argument(
+        "--max-retries",
+        type=int,
+        default=1,
+        dest="max_retries",
+        metavar="N",
+        help="Maximum attempts per task (default: 1 = no retry).",
+    )
+    exec_grp.add_argument(
+        "--timeout-multiplier",
+        type=float,
+        default=1.0,
+        dest="timeout_multiplier",
+        help="Scale all task timeouts by this factor (default: 1.0).",
+    )
+    exec_grp.add_argument(
+        "--docker-image",
+        default=None,
+        help=(
+            "Docker image override. "
+            "copaw mode default: qwenclawbench-copaw:latest (pre-built with qwenpaw); "
+            "openclaw mode default: ghcr.io/openclaw/openclaw:main."
+        ),
+    )
+    exec_grp.add_argument(
+        "--thinking",
+        default=None,
+        metavar="LEVEL",
+        help="[openclaw] Thinking level: low | medium | high | xhigh.",
+    )
+    exec_grp.add_argument(
+        "--skip-bootstrap",
+        action="store_true",
+        default=True,
+        dest="skip_bootstrap",
+        help="[openclaw] Remove BOOTSTRAP.md from the task workspace before execution.",
+    )
+
+    model_grp = p.add_argument_group("Model & API configuration")
+    model_grp.add_argument(
+        "--model",
+        action="append",
+        default=None,
+        metavar="MODEL_ID",
+        help=(
+            "LLM model identifier, e.g. 'openai/gpt-4o', "
+            "'anthropic/claude-sonnet-4-6', 'dashscope/qwen3.6-plus'. "
+            "Can be passed multiple times to run multiple models sequentially. "
+            "Falls back to $OPENAI_MODEL."
+        ),
+    )
+    model_grp.add_argument(
+        "--api-key",
+        action="append",
+        default=None,
+        dest="api_key",
+        help="API key (overrides $OPENAI_API_KEY).",
+    )
+    model_grp.add_argument(
+        "--base-url",
+        action="append",
+        default=None,
+        dest="base_url",
+        help="Custom OpenAI-compatible API base URL (overrides $OPENAI_BASE_URL).",
+    )
+
+    judge_grp = p.add_argument_group("Judge configuration")
+    judge_grp.add_argument(
+        "--judge",
+        default=None,
+        metavar="MODEL_ID",
+        help="Judge model identifier (default: claude-opus-4-5-20251101).",
+    )
+    judge_grp.add_argument(
+        "--judge-api-key",
+        default=None,
+        dest="judge_api_key",
+        help="API key for the LLM judge (falls back to $JUDGE_API_KEY, then --api-key).",
+    )
+    judge_grp.add_argument(
+        "--judge-base-url",
+        default=None,
+        dest="judge_base_url",
+        help="Base URL for the LLM judge endpoint (falls back to $JUDGE_BASE_URL, then --base-url).",
+    )
+    judge_grp.add_argument(
+        "--judge-timeout",
+        type=float,
+        default=300.0,
+        dest="judge_timeout",
+        help="HTTP timeout (seconds) for each LLM judge API call (default: 300).",
+    )
+
+    out_grp = p.add_argument_group("Results")
+    out_grp.add_argument(
+        "--results-dir",
+        type=Path,
+        default=Path("./results"),
+        dest="results_dir",
+        help=(
+            "Base directory for results (default: ./results). "
+            "Actual output: <dir>/<timestamp>/pawbench/<model>/<agent>/ "
+            "unless --no-results-version-path is set."
+        ),
+    )
+    out_grp.add_argument(
+        "--no-results-version-path",
+        action="store_true",
+        dest="no_results_version_path",
+        help=(
+            "Write under <results-dir>/pawbench/<model>/<agent>/ only (no timestamp subfolder; "
+            "re-runs overwrite previous results)."
+        ),
+    )
+    out_grp.add_argument(
+        "--save-workspace",
+        action="store_true",
+        default=True,
+        dest="save_workspace",
+        help=(
+            "Save the agent workspace (AGENT_WORKSPACE container contents) to "
+            "<results-dir>/workspaces/<task_id>/ after each task completes."
+        ),
+    )
+    out_grp.add_argument(
+        "--save-docker-image",
+        action="store_true",
+        default=False,
+        dest="save_docker_image",
+        help=(
+            "After each task completes, commit the Docker container and export it as a "
+            ".tar image to <results-dir>/docker_images/<task_id>.tar."
+        ),
+    )
+
+    misc_grp = p.add_argument_group("Miscellaneous")
+    misc_grp.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Enable verbose output from the benchmark runner.",
+    )
+
+    return p.parse_args()
+
+
+# ── helpers ────────────────────────────────────────────────────────────────────
+
+def _sanitize_model_id(model_id: str) -> str:
+    safe = []
+    for ch in model_id.strip():
+        if ch.isalnum() or ch in ("-", "_", ".", "+"):
+            safe.append(ch)
+        elif ch in ("/", ":", "@"):
+            safe.append("-")
+        else:
+            safe.append("_")
+    return "".join(safe).strip("-_") or "model"
+
+
+def _filesystem_model_label(model_id: str) -> str:
+    """Strip ``provider/model`` → ``model`` for directory names."""
+    s = model_id.strip()
+    if "/" in s:
+        s = s.split("/", 1)[1]
+    return _sanitize_model_id(s)
+
+
+def _run_timestamp() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+
+def _resolve_per_model_values(
+    models: list[str | None],
+    api_keys: list[str] | None,
+    base_urls: list[str] | None,
+) -> tuple[list[str | None], list[str | None], list[str]]:
+    n = len(models)
+
+    def normalize(values: list[str] | None, name: str) -> list[str | None]:
+        if not values:
+            return [None] * n
+        if len(values) == 1:
+            return [values[0]] * n
+        if len(values) == n:
+            return list(values)
+        raise ValueError(
+            f"{name} must be provided either once or {n} times to match --model entries."
+        )
+
+    norm_keys = normalize(api_keys, "--api-key")
+    norm_base_urls_raw = normalize(base_urls, "--base-url")
+    norm_base_urls: list[str] = [
+        bu or os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1")
+        for bu in norm_base_urls_raw
+    ]
+    return models, norm_keys, norm_base_urls
+
+
+# ── main ───────────────────────────────────────────────────────────────────────
+
+def _load_dotenv(env_file: Path | None = None) -> None:
+    """Load key=value pairs from a .env file into os.environ.
+
+    Existing environment variables are NOT overwritten so that explicit
+    shell exports always take precedence over the file.  Lines starting
+    with '#' and blank lines are skipped.  Inline comments after the
+    value are not supported (values are taken verbatim after the '=').
+    """
+    path = env_file or (_SCRIPT_DIR / ".env")
+    if not path.exists():
+        return
+    with open(path) as fh:
+        for raw in fh:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+async def main() -> int:
+    # Load .env before parse_args so env-var fallbacks in argparse already see
+    # the values (e.g. OPENAI_MODEL, OPENAI_API_KEY, OPENAI_BASE_URL …).
+    _load_dotenv()
+
+    args = parse_args()
+
+    models: list[str | None]
+    if args.model:
+        models = list(args.model)
+    else:
+        models = [os.environ.get("OPENAI_MODEL")]
+
+    try:
+        models, api_keys, base_urls = _resolve_per_model_values(
+            models=models, api_keys=args.api_key, base_urls=args.base_url,
+        )
+    except ValueError as e:
+        print(f"Error: {e}")
+        return 1
+
+    env_api_key = os.environ.get("OPENAI_API_KEY")
+    api_keys = [k if k is not None else env_api_key for k in api_keys]
+
+    benchmark_path = args.benchmark_path or _DEFAULT_BENCHMARK_PATH
+    if not benchmark_path.exists():
+        print(
+            f"Error: benchmark directory not found: {benchmark_path}\n"
+            f"Expected: benchmarks/pawbench/"
+        )
+        return 1
+
+    if any(m is None for m in models):
+        print("Error: --model is required (or set $OPENAI_MODEL).")
+        return 1
+
+    base_results_dir = Path(args.results_dir)
+    agents = args.agents or ["copaw"]
+
+    run_ts = _run_timestamp()
+
+    # Build full run matrix: models × agents
+    run_matrix = [
+        (model, api_key, base_url, agent)
+        for (model, api_key, base_url) in zip(models, api_keys, base_urls, strict=True)
+        for agent in agents
+    ]
+    total = len(run_matrix)
+
+    for idx, (model, api_key, base_url, agent_label) in enumerate(run_matrix, start=1):
+        model_label = _filesystem_model_label(model or "default")
+        if args.no_results_version_path:
+            run_results_dir = base_results_dir / _BENCHMARK_NAME / model_label / agent_label
+        else:
+            run_results_dir = (
+                base_results_dir / run_ts / _BENCHMARK_NAME / model_label / agent_label
+            )
+        run_results_dir.mkdir(parents=True, exist_ok=True)
+
+        print("\n" + "─" * 80)
+        print(f"[{idx}/{total}] Model: {model}  Agent: {agent_label}")
+        print(f"Results dir: {run_results_dir}")
+        print("─" * 80 + "\n")
+
+        run_args = argparse.Namespace(**vars(args))
+        run_args.results_dir = run_results_dir
+
+        rc = await _run_benchmark(run_args, model, api_key, base_url, benchmark_path, agent_label)
+        if rc != 0:
+            return rc
+
+    return 0
+
+
+async def _run_benchmark(
+    args: argparse.Namespace,
+    model: str,
+    api_key: str | None,
+    base_url: str,
+    benchmark_path: Path,
+    agent_label: str = "copaw",
+) -> int:
+    print(f"Benchmark : {_BENCHMARK_NAME}")
+    print(f"Path      : {benchmark_path}")
+    print(f"Model     : {model}")
+    print(f"Agent     : {agent_label}")
+
+    backend = PawBenchBackend(benchmark_path)
+
+    agent_config: dict = {
+        "model": model,
+        "api_key": api_key,
+        "base_url": base_url,
+        "timeout_multiplier": args.timeout_multiplier,
+        "verbose": args.verbose,
+        "docker_image": args.docker_image,
+        "agent_type": agent_label,
+    }
+
+    if args.judge:
+        agent_config["judge_model"] = args.judge
+
+    resolved_judge_api_key = (
+        getattr(args, "judge_api_key", None)
+        or os.environ.get("JUDGE_API_KEY")
+        or api_key
+    )
+    resolved_judge_base_url = (
+        getattr(args, "judge_base_url", None)
+        or os.environ.get("JUDGE_BASE_URL")
+        or base_url
+    )
+    if resolved_judge_api_key:
+        agent_config["judge_api_key"] = resolved_judge_api_key
+    if resolved_judge_base_url:
+        agent_config["judge_base_url"] = resolved_judge_base_url
+
+    agent_config["judge_timeout_seconds"] = getattr(args, "judge_timeout", 300.0)
+
+    if args.thinking:
+        agent_config["thinking_level"] = args.thinking
+    if args.dataset:
+        agent_config["dataset"] = args.dataset
+    api_model_name = os.environ.get("BENCH_API_MODEL_NAME")
+    if api_model_name:
+        agent_config["api_model_name"] = api_model_name
+    if getattr(args, "skip_bootstrap", False):
+        agent_config["skip_bootstrap"] = True
+    if getattr(args, "save_workspace", False):
+        agent_config["save_workspace"] = True
+    if getattr(args, "save_docker_image", False):
+        agent_config["save_docker_image"] = True
+
+    load_kwargs: dict = {}
+    if args.dataset:
+        load_kwargs["dataset"] = args.dataset
+
+    runner = BenchmarkRunner(
+        backend=backend,
+        results_dir=args.results_dir,
+        concurrency=args.concurrency,
+        max_retries=args.max_retries,
+    )
+    results = await runner.run(
+        agent_config=agent_config,
+        task_filter=args.tasks,
+        **load_kwargs,
+    )
+    print(f"\nDone. {len(results)} result(s) written to {args.results_dir}/")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(asyncio.run(main()))

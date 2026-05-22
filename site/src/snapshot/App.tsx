@@ -147,7 +147,9 @@ export default function App() {
 
       {tab === 'leaderboard' && (
         <Hero
+          totalTasks={D.stats.total}
           tagline={t('site.tagline')}
+          formula={t('hero.formula', 'Agent Performance = f(Model, Harness)')}
           description={t('site.description')}
           stats={[
             { value: D.stats.total, label: t('hero.stats.tasks', 'Tasks') },
@@ -158,13 +160,13 @@ export default function App() {
         />
       )}
 
-      <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-8 space-y-12">
+      <main className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 pt-6 pb-10 space-y-10">
         {tab === 'leaderboard' && (
           <>
-            <Section title={t('leaderboard.matrix.title')} subtitle={t('leaderboard.subtitle')}>
+            <Section title={t('leaderboard.matrix.title')}>
               <HarnessMatrix data={D.leaderboard} labels={matrixLabels} />
             </Section>
-            <Section title={t('leaderboard.title')} subtitle={t('leaderboard.subtitle')}>
+            <Section title={t('leaderboard.title')}>
               <LeaderboardTable data={D.leaderboard} labels={tableLabels} />
             </Section>
           </>
@@ -308,27 +310,49 @@ function Topbar({
 }
 
 function Hero({
-  tagline, description, stats,
+  totalTasks, tagline, formula, description, stats,
 }: {
+  totalTasks: number;
   tagline: string;
+  formula: string;
   description: string;
   stats: Array<{ value: string | number; label: string }>;
 }) {
   return (
     <section className="relative overflow-hidden border-b border-slate-200 dark:border-slate-800 bg-gradient-to-br from-brand-50 via-white to-white dark:from-brand-950/40 dark:via-slate-950 dark:to-slate-950">
-      <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8 py-10 sm:py-14">
-        <h1 className="text-3xl sm:text-4xl font-bold tracking-tight text-slate-900 dark:text-white">
-          {tagline}
+      <div className="mx-auto max-w-4xl px-4 sm:px-6 lg:px-8 pt-8 pb-6 text-center">
+        <div className="flex justify-center text-xs text-brand-700 dark:text-brand-300 font-medium mb-3">
+          <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full bg-brand-50 dark:bg-brand-950/50 border border-brand-200 dark:border-brand-900">
+            <span className="w-1.5 h-1.5 rounded-full bg-brand-500 animate-pulse" />
+            v1.0 · {totalTasks} tasks
+          </span>
+        </div>
+
+        <h1 className="text-4xl sm:text-5xl font-bold tracking-tight text-slate-900 dark:text-white">
+          <span className="text-brand-700 dark:text-brand-400">paw</span><span>bench</span>
         </h1>
-        <p className="mt-3 max-w-3xl text-sm sm:text-base text-slate-600 dark:text-slate-400">
+
+        <p className="mt-2 text-base sm:text-lg text-slate-700 dark:text-slate-200 font-medium">
+          {tagline}
+        </p>
+
+        <div className="mt-4 flex justify-center">
+          <code className="inline-block text-xs sm:text-sm font-mono px-2 py-0.5 rounded bg-brand-50 dark:bg-brand-950/40 border border-brand-200 dark:border-brand-900 text-brand-800 dark:text-brand-200 whitespace-nowrap">
+            {formula}
+          </code>
+        </div>
+
+        <p className="mt-3 text-sm text-slate-600 dark:text-slate-400">
           {description}
         </p>
-        <div className="mt-6 grid grid-cols-2 sm:grid-cols-4 gap-3 max-w-2xl">
-          {stats.map((s) => (
-            <div key={s.label} className="rounded-lg border border-slate-200 dark:border-slate-800 bg-white/70 dark:bg-slate-900/40 px-3 py-2">
-              <div className="text-2xl font-bold tabular-nums text-brand-700 dark:text-brand-300">{s.value}</div>
-              <div className="text-xs text-slate-500 mt-0.5">{s.label}</div>
-            </div>
+
+        <div className="mt-5 flex flex-wrap justify-center items-baseline gap-x-3 gap-y-1 text-xs text-slate-500">
+          {stats.map((s, i) => (
+            <span key={s.label} className="inline-flex items-baseline gap-1">
+              {i > 0 && <span className="text-slate-300 dark:text-slate-700" aria-hidden="true">·</span>}
+              <span className="font-bold tabular-nums text-slate-700 dark:text-slate-300 text-sm">{s.value}</span>
+              <span>{s.label}</span>
+            </span>
           ))}
         </div>
       </div>
