@@ -50,6 +50,13 @@ site/
 
 Prereqs: Node 20+, Python 3.11+, `pip install pyyaml`.
 
+> **No `result/` folder needed.** After clone, the repo already ships
+> `submissions/*.json`, so `npm run build:data` produces a full leaderboard
+> without any local evaluation runs. The `result/` directory (gitignored raw
+> runs) is only required when you want to regenerate `submissions/` from fresh
+> harness output; if it is missing, `aggregate_results.py` skips quietly and
+> the build continues.
+
 ```bash
 cd site
 npm install
