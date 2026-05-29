@@ -95,7 +95,7 @@ def grade_task(
             judge_timeout_seconds=judge_timeout_seconds,
             verbose=verbose,
         )
-        return _combine_grades(task, auto_result, llm_result)
+        return _combine_grades(task, auto_result, llm_result, execution_result)
 
     raise ValueError(f"Unknown grading type: {grading_type!r}")
 
@@ -112,6 +112,31 @@ def _grade_automated(
             grading_type="automated", breakdown={}, notes="No automated grading code found",
         )
 
+    # Diagnostic: print workspace state and pytest availability BEFORE calling grade_func.
+    import subprocess as _subprocess_mod
+    ws_path = execution_result.get("workspace", "")
+    ws_dir = Path(ws_path) if ws_path else None
+    ws_exists = ws_dir.is_dir() if ws_dir else False
+    ws_files = sorted(p.name for p in ws_dir.iterdir()) if ws_exists else []
+    print(
+        f"[grader] pre-grade  task={task.task_id}\n"
+        f"  workspace_path={ws_path!r}  exists={ws_exists}  files={ws_files}",
+        flush=True,
+    )
+    # Check pytest importability
+    try:
+        import pytest as _pytest  # noqa: F401
+        print(f"[grader] pytest importable v{_pytest.__version__} via {_pytest.__file__}", flush=True)
+    except ImportError as _pie:
+        print(f"[grader] pytest NOT importable: {_pie}", flush=True)
+        # Try running sys.executable -m pytest to see what happens
+        import sys as _sys
+        _pr = _subprocess_mod.run(
+            [_sys.executable, "-m", "pytest", "--version"],
+            capture_output=True, text=True, timeout=30,
+        )
+        print(f"[grader] pytest -m check: rc={_pr.returncode} out={_pr.stdout!r} err={_pr.stderr!r}", flush=True)
+
     namespace: Dict[str, Any] = {}
     exec(grading_code, namespace)  # noqa: S102
     grade_func = namespace.get("grade")
@@ -121,12 +146,44 @@ def _grade_automated(
             grading_type="automated", breakdown={}, notes="Automated grading function missing",
         )
 
-    scores = grade_func(
-        execution_result.get("transcript", []),
-        execution_result.get("workspace", ""),
-    )
+    # Patch sys.modules["subprocess"] temporarily so that `import subprocess`
+    # inside grade_func picks up our logging wrapper.
+    import sys as _sys_mod
+    import types as _types_mod
+    _orig_subproc = _sys_mod.modules.get("subprocess")
+    _logging_mod = _types_mod.ModuleType("subprocess")
+    _logging_mod.__dict__.update(vars(_subprocess_mod))
+
+    def _logged_run(*args, **kwargs):  # noqa: D401
+        result = _subprocess_mod.run(*args, **kwargs)
+        cmd_str = " ".join(str(a) for a in (args[0] if args else []))
+        print(
+            f"[grader.subprocess.run] cmd={cmd_str!r}\n"
+            f"  returncode={result.returncode}\n"
+            f"  stdout={getattr(result, 'stdout', b'')!r}\n"
+            f"  stderr={getattr(result, 'stderr', b'')!r}",
+            flush=True,
+        )
+        return result
+
+    _logging_mod.run = _logged_run  # type: ignore[attr-defined]
+    _sys_mod.modules["subprocess"] = _logging_mod  # type: ignore[assignment]
+
+    try:
+        scores = grade_func(
+            execution_result.get("transcript", []),
+            execution_result.get("workspace", ""),
+        )
+    finally:
+        if _orig_subproc is not None:
+            _sys_mod.modules["subprocess"] = _orig_subproc
+        else:
+            _sys_mod.modules.pop("subprocess", None)
+
     if not isinstance(scores, dict):
         scores = {}
+
+    print(f"[grader] automated scores for {task.task_id}: {scores}", flush=True)
 
     if verbose:
         logger.info("Automated grading scores: %s", scores)
@@ -234,29 +291,84 @@ def _call_llm_judge_api(
     except urllib.error.URLError as exc:
         raise RuntimeError(f"LLM judge API request failed: {exc}") from exc
 
+    # OpenAI-compatible format: {"choices": [{"message": {"content": "..."}}]}
     choices = body.get("choices", [])
-    if not choices:
-        raise RuntimeError(f"LLM judge API returned no choices: {body}")
-    return choices[0].get("message", {}).get("content", "")
+    if choices:
+        return choices[0].get("message", {}).get("content", "")
+
+    # Anthropic Messages API format: {"content": [{"type": "text", "text": "..."}]}
+    anthropic_content = body.get("content", [])
+    if anthropic_content:
+        text_blocks = [b.get("text", "") for b in anthropic_content if b.get("type") == "text"]
+        if text_blocks:
+            return "\n".join(text_blocks)
+
+    raise RuntimeError(f"LLM judge API returned unrecognized response format: {body}")
 
 
 # ── hybrid grading ────────────────────────────────────────────────────────────
 
-def _combine_grades(task: Task, auto_result: GradeResult, llm_result: GradeResult) -> GradeResult:
+def _combine_grades(
+    task: Task,
+    auto_result: GradeResult,
+    llm_result: GradeResult,
+    execution_result: Optional[Dict[str, Any]] = None,
+) -> GradeResult:
+    """Combine automated and LLM-judge scores into a hybrid grade.
+
+    Normally the LLM judge contribution is zeroed out when auto_score <
+    AUTO_PENALTY_THRESHOLD (to prevent the judge from rescuing a completely
+    failed run).  However, if anomaly detection indicates the low auto score
+    was caused by a true API communication failure (rate limit, server error,
+    terminal API failure), the penalty is skipped so the LLM judge score is
+    preserved.
+
+    Note: EMPTY_TRANSCRIPT and ZERO_TOKEN_RESPONSE are intentionally excluded
+    from the penalty-skip set.  When the agent produced no output at all, the
+    LLM judge has nothing to evaluate and tends to return 1.0 by default,
+    which would create an artificial "consolation score" (~0.5) despite a
+    complete execution failure.  Only genuine mid-run API interruptions
+    (TERMINAL_API_FAILURE, API_RATE_LIMIT, API_SERVER_ERROR) warrant skipping
+    the penalty.
+    """
+    from .utils.anomalies import detect_anomalies, API_FAILURE_IDS
+
+    # Exclude empty-output anomalies: the LLM judge cannot meaningfully score
+    # an empty transcript, so preserving its score would be misleading.
+    INFRA_FAILURE_IDS = API_FAILURE_IDS - {"EMPTY_TRANSCRIPT", "ZERO_TOKEN_RESPONSE"}
+
     weights = task.grading_weights or {"automated": 0.5, "llm_judge": 0.5}
     auto_weight = float(weights.get("automated", 0.5))
     llm_weight = float(weights.get("llm_judge", 0.5))
     total_weight = auto_weight + llm_weight or 1.0
 
     score_simple = (auto_result.score * auto_weight + llm_result.score * llm_weight) / total_weight
-    llm_adj = 0.0 if auto_result.score < AUTO_PENALTY_THRESHOLD else llm_result.score
-    score = (auto_result.score * auto_weight + llm_adj * llm_weight) / total_weight
+
+    # Detect whether a low automated score is due to a mid-run API failure.
+    # If so, use the simple weighted average instead of penalizing the LLM judge.
+    skip_penalty = False
+    penalty_reason = ""
+    if auto_result.score < AUTO_PENALTY_THRESHOLD and execution_result is not None:
+        anomaly = detect_anomalies(execution_result, auto_result.notes)
+        triggered_ids = {item["id"] for item in anomaly.get("items", [])}
+        if triggered_ids & INFRA_FAILURE_IDS:
+            skip_penalty = True
+            matched = triggered_ids & INFRA_FAILURE_IDS
+            penalty_reason = f"[penalty skipped: API failure detected — {', '.join(sorted(matched))}]"
+
+    if skip_penalty:
+        score = score_simple
+        llm_adj = llm_result.score
+    else:
+        llm_adj = 0.0 if auto_result.score < AUTO_PENALTY_THRESHOLD else llm_result.score
+        score = (auto_result.score * auto_weight + llm_adj * llm_weight) / total_weight
 
     breakdown = {
         **{f"automated.{k}": v for k, v in auto_result.breakdown.items()},
         **{f"llm_judge.{k}": v for k, v in llm_result.breakdown.items()},
     }
-    notes = " | ".join(filter(None, [auto_result.notes, llm_result.notes]))
+    notes_parts = [p for p in [auto_result.notes, llm_result.notes, penalty_reason] if p]
+    notes = " | ".join(notes_parts)
     return GradeResult(
         task_id=task.task_id, score=score, score_simple=score_simple,
         max_score=1.0, grading_type="hybrid", breakdown=breakdown, notes=notes,

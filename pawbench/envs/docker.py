@@ -116,10 +116,7 @@ class DockerEnvironment(BaseEnvironment):
                 stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=wait_timeout)
             except asyncio.TimeoutError:
                 process.kill()
-                try:
-                    await asyncio.wait_for(process.wait(), timeout=30)
-                except asyncio.TimeoutError:
-                    pass  # already SIGKILL'd; OS will reap it eventually
+                await process.wait()
                 raise TimeoutError(f"Command timed out after {wait_timeout} seconds")
 
             return {

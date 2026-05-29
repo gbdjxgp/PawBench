@@ -2,7 +2,7 @@
 
 import os
 from typing import Dict, Optional, Any
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 
 
@@ -25,112 +25,30 @@ class ModelConfig:
     base_url: str
     api_version: Optional[str] = None  # For Azure
     extra_config: Optional[Dict[str, Any]] = None
-
-    # Vision capability fields.
-    # ``supports_vision`` is True when the model itself accepts image input
-    # (i.e. it is a vision-language model like qwen-vl-max or gpt-4o).
-    # ``vision_model`` is the companion VL model name (bare, no provider prefix)
-    # that should be used for image-tool calls when the primary model is
-    # text-only.  Both fields are populated by ModelConfigManager based on the
-    # known-models registry below; they are left as defaults for unknown models.
+    # Capability flags (used by agent impl to configure model metadata)
     supports_vision: bool = False
-    vision_model: Optional[str] = None
+    reasoning: bool = False
+    context_window: Optional[int] = None
+    max_tokens: Optional[int] = None
+    # Optional companion vision model (for text-only models that need a separate VL model)
+    vision_model: str = ""
 
     def get_full_model_identifier(self) -> str:
         """Get the full model identifier in provider/model format."""
         return f"{self.provider.value}/{self.model_name}"
 
-    # Treat this URL as "no explicit base_url" when the provider is not OpenAI.
-    # AgentFactory always fills in this default when the caller omits --base-url,
-    # so checking equality lets resolve_with() fall back to the provider-specific URL.
-    _OPENAI_DEFAULT_URL: str = "https://api.openai.com/v1"
-
-    def resolve_with(self, agent_config: Dict[str, Any]) -> "ResolvedModelConfig":
-        """Return a ResolvedModelConfig applying agent_config overrides.
-
-        Priority for api_key : agent_config["api_key"] > self.api_key (from env)
-        Priority for base_url: agent_config["base_url"] > self.base_url (provider default)
-
-        The generic OpenAI fallback URL is treated as "not explicit" for non-OpenAI
-        providers, so DashScope / Anthropic / Google models fall back to their
-        provider-specific endpoint even when AgentFactory injects the default.
-        """
-        api_key: str = agent_config.get("api_key") or self.api_key or ""
-
-        config_url: str = agent_config.get("base_url") or ""
-        explicit_base_url = bool(config_url) and not (
-            config_url.rstrip("/") == self._OPENAI_DEFAULT_URL.rstrip("/")
-            and self.provider != ProviderType.OPENAI
-        )
-        base_url = config_url if explicit_base_url else self.base_url
-
-        return ResolvedModelConfig(
-            model_config=self,
-            api_key=api_key,
-            base_url=base_url,
-            explicit_base_url=explicit_base_url,
-            supports_vision=self.supports_vision,
-            vision_model=self.vision_model,
-        )
-
-
-@dataclass
-class ResolvedModelConfig:
-    """Result of ModelConfig.resolve_with(): api_key / base_url after agent overrides."""
-    model_config: ModelConfig
-    api_key: str
-    base_url: str
-    explicit_base_url: bool      # True only when caller explicitly provided a non-default URL
-    supports_vision: bool        # mirrors model_config.supports_vision for convenience
-    vision_model: Optional[str]  # mirrors model_config.vision_model for convenience
-
 
 class ModelConfigManager:
     """Manages model configurations for different providers."""
-
-    # ── vision capability registry ─────────────────────────────────────────
-    # Model names (bare, no provider prefix) that support image input natively.
-    # Used to set ModelConfig.supports_vision = True.
-    _VISION_CAPABLE_MODELS: frozenset = frozenset({
-        # OpenAI
-        "gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4-vision-preview",
-        "gpt-5.4", "gpt-5.4-mini", "gpt-5.5", "gpt-5.5-medium",
-        # Anthropic (Claude 3+ all support vision)
-        "claude-3-opus-20240229", "claude-3-5-sonnet-20241022", "claude-3-haiku-20240307",
-        "claude-sonnet-4-6", "claude-opus-4-7", "claude-haiku-4-5",
-        # Google (Gemini 1.5+ all support vision)
-        "gemini-1.5-pro", "gemini-1.5-flash",
-        "gemini-3.1-pro-preview", "gemini-3.0-flash",
-        # DashScope — explicit VL models only; qwen3.x-plus are text-only
-        "qwen-vl-max", "qwen-vl-max-latest", "qwen-vl-plus",
-        "qwen2-vl-72b-instruct", "qwen2-vl-7b-instruct", "qwen2-vl-2b-instruct",
-        "qvq-72b-preview",
-    })
-
-    # For text-only models: the recommended VL companion on the same provider.
-    # Key = bare model name; value = bare VL model name (same provider assumed).
-    # If a model is NOT in this dict and NOT in _VISION_CAPABLE_MODELS, no
-    # vision companion is configured (agent must handle vision itself or skip).
-    _VISION_COMPANION: Dict[str, str] = {
-        # DashScope text-only models → qwen-vl-max (same key, same endpoint)
-        "qwen3.6-plus":  "qwen-vl-max",
-        "qwen3.5-plus":  "qwen-vl-max",
-        "qwen3-max":     "qwen-vl-max",
-        "qwen3-plus":    "qwen-vl-max",
-        "qwen3-turbo":   "qwen-vl-max",
-        # OpenAI text-only / legacy models → gpt-4o
-        "gpt-3.5-turbo": "gpt-4o",
-        "gpt-4":         "gpt-4o",
-    }
 
     PROVIDER_DEFAULT_URLS = {
         ProviderType.ANTHROPIC: "https://api.anthropic.com",
         ProviderType.OPENAI: "https://api.openai.com/v1",
         ProviderType.GOOGLE: "https://generativelanguage.googleapis.com",
         ProviderType.AZURE: "",  # Azure needs specific endpoint
-        # DashScope OpenAI-compatible endpoint; override with DASHSCOPE_BASE_URL for
-        # the China mainland endpoint (https://dashscope.aliyuncs.com/compatible-mode/v1)
-        ProviderType.DASHSCOPE: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+        # Default to CN DashScope endpoint; override with DASHSCOPE_BASE_URL or set
+        # DASHSCOPE_INTL=1 to use the international endpoint.
+        ProviderType.DASHSCOPE: "https://dashscope.aliyuncs.com/compatible-mode/v1",
         ProviderType.CUSTOM: "https://api.openai.com/v1",  # Default to OpenAI-compatible
     }
 
@@ -156,8 +74,17 @@ class ModelConfigManager:
                 # Unknown provider, treat as custom
                 provider = ProviderType.CUSTOM
         else:
-            # No provider specified, assume OpenAI
-            provider = ProviderType.OPENAI
+            # No provider specified — infer from environment base_url first,
+            # then fall back to OPENAI so qwenpaw doesn't hit api.openai.com
+            # when running on clusters that can only reach DashScope.
+            env_base_url = (
+                os.getenv("OPENAI_BASE_URL", "")
+                or os.getenv("MODEL_BASE_URL", "")
+            ).lower()
+            if "dashscope.aliyuncs.com" in env_base_url:
+                provider = ProviderType.DASHSCOPE
+            else:
+                provider = ProviderType.OPENAI
             model_name = model_identifier
 
         # Get API key from environment or config
@@ -171,11 +98,12 @@ class ModelConfigManager:
         if provider == ProviderType.AZURE:
             api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2023-05-15")
 
-        supports_vision = model_name in cls._VISION_CAPABLE_MODELS
-        vision_model = (
-            None if supports_vision
-            else cls._VISION_COMPANION.get(model_name)
-        )
+        # Pawbench default: every model under evaluation is treated as multimodal.
+        # Image/vision paths use the same model id (see openclaw_agent imageModel).
+        # Opt out only when agent_config sets a separate vision_model companion.
+        supports_vision = True
+        reasoning_keywords = ("o1", "o3", "thinking", "reasoning", "r1", "r2", "a3b")
+        reasoning = any(kw in model_name.lower() for kw in reasoning_keywords)
 
         return ModelConfig(
             provider=provider,
@@ -184,7 +112,7 @@ class ModelConfigManager:
             base_url=base_url,
             api_version=api_version,
             supports_vision=supports_vision,
-            vision_model=vision_model,
+            reasoning=reasoning,
         )
 
     @classmethod

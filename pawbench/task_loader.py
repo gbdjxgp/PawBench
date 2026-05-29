@@ -41,7 +41,6 @@ class Task:
         grading_weights: Optional[Dict[str, float]] = None,
         file_path: Optional[Path] = None,
         frontmatter: Optional[Dict[str, Any]] = None,
-        labels: Optional[Dict[str, Any]] = None,
     ):
         self.task_id = task_id
         self.name = name
@@ -57,7 +56,6 @@ class Task:
         self.grading_weights = grading_weights
         self.file_path = file_path
         self.frontmatter = frontmatter or {}
-        self.labels: Dict[str, Any] = labels or {}
 
     def __repr__(self) -> str:
         return f"Task(id={self.task_id!r}, name={self.name!r}, category={self.category!r})"
@@ -77,7 +75,6 @@ class Task:
             "has_llm_judge_rubric": self.llm_judge_rubric is not None,
             "grading_weights": self.grading_weights,
             "frontmatter": self.frontmatter,
-            "labels": self.labels,
         }
 
 
@@ -89,21 +86,9 @@ class TaskLoader:
         logger.info("TaskLoader initialised: %s", tasks_dir)
 
     def load_all_tasks(self) -> List[Task]:
-        """Load every task Markdown file found in *tasks_dir*.
-
-        Supports both naming conventions:
-        - Legacy per-dataset layout: ``task_*.md``
-        - Flat consolidated layout:  ``T*.md`` (e.g. T105_qwenpawbench_003-output-preference.md)
-        """
+        """Load every ``task_*.md`` file found in *tasks_dir*."""
         tasks: List[Task] = []
-        seen: set = set()
-        all_files: list = []
-        for pattern in ("task_*.md", "T*.md"):
-            for f in self.tasks_dir.glob(pattern):
-                if f not in seen:
-                    seen.add(f)
-                    all_files.append(f)
-        task_files = sorted(all_files)
+        task_files = sorted(self.tasks_dir.glob("task_*.md"))
         logger.info("Found %d task file(s)", len(task_files))
         for task_file in task_files:
             try:
@@ -158,7 +143,6 @@ class TaskLoader:
             grading_weights=metadata.get("grading_weights"),
             file_path=task_file,
             frontmatter=metadata,
-            labels=metadata.get("labels") or {},
         )
 
     # ── internal helpers ──────────────────────────────────────────────────────

@@ -22,7 +22,8 @@ interface Props {
         | 'bucket.help'
         | 'pivot.summary'
         | 'pivot.taskCount'
-        | 'pivot.bestCol'
+        | 'pivot.avgCol'
+        | 'pivot.rowAvg'
         | 'noModelData',
         string
       >
@@ -273,12 +274,32 @@ function PivotMatrix({
     }
     hs.sort();
     ms.sort((a, b) => {
-      const bestA = Math.max(...hs.map((h) => cm.get(`${a}/${h}`) ?? -Infinity));
-      const bestB = Math.max(...hs.map((h) => cm.get(`${b}/${h}`) ?? -Infinity));
-      return bestB - bestA;
+      const avgA = mean(hs.map((h) => cm.get(`${a}/${h}`)).filter((v): v is number => typeof v === 'number'));
+      const avgB = mean(hs.map((h) => cm.get(`${b}/${h}`)).filter((v): v is number => typeof v === 'number'));
+      return (avgB ?? -Infinity) - (avgA ?? -Infinity);
     });
     return { models: ms, harnesses: hs, cellMap: cm, anyData: any };
   }, [data.rows, rowField, bucketLabel]);
+
+  const harnessAvgs = useMemo(() => {
+    const out: Record<string, number | null> = {};
+    for (const h of harnesses) {
+      const vs = models
+        .map((m) => cellMap.get(`${m}/${h}`))
+        .filter((v): v is number => typeof v === 'number');
+      out[h] = mean(vs);
+    }
+    return out;
+  }, [models, harnesses, cellMap]);
+
+  const grandAvg = useMemo(() => {
+    const vs = models.flatMap((m) =>
+      harnesses
+        .map((h) => cellMap.get(`${m}/${h}`))
+        .filter((v): v is number => typeof v === 'number')
+    );
+    return mean(vs);
+  }, [models, harnesses, cellMap]);
 
   return (
     <div>
@@ -321,7 +342,7 @@ function PivotMatrix({
                     </th>
                   );
                 })}
-                <th className="px-3 py-2 text-right font-medium">{l(labels, 'pivot.bestCol', 'best')}</th>
+                <th className="px-3 py-2 text-right font-medium">{l(labels, 'pivot.avgCol', 'avg')}</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 dark:divide-slate-800">
@@ -329,7 +350,7 @@ function PivotMatrix({
                 const vals = harnesses
                   .map((h) => cellMap.get(`${m}/${h}`))
                   .filter((v): v is number => typeof v === 'number');
-                const best = vals.length ? Math.max(...vals) : null;
+                const avg = mean(vals);
                 return (
                   <tr key={m}>
                     <td className="px-4 py-2 sticky left-0 bg-white dark:bg-slate-950 font-medium text-slate-800 dark:text-slate-200 whitespace-nowrap">
@@ -349,12 +370,46 @@ function PivotMatrix({
                       );
                     })}
                     <td className="px-3 py-2 text-right tabular-nums font-semibold text-brand-700 dark:text-brand-300">
-                      {best == null ? '—' : (best * 100).toFixed(1)}
+                      {avg == null ? '—' : (avg * 100).toFixed(1)}
                     </td>
                   </tr>
                 );
               })}
             </tbody>
+            <tfoot>
+              <tr className="border-t-2 border-brand-200 dark:border-brand-800 bg-slate-50/70 dark:bg-slate-900/40 text-xs">
+                <th className="text-left px-4 py-2 font-semibold uppercase tracking-wide text-slate-500 dark:text-slate-400 sticky left-0 bg-slate-50/70 dark:bg-slate-900/40">
+                  {l(labels, 'pivot.rowAvg', 'Avg')}
+                </th>
+                {harnesses.map((h) => {
+                  const v = harnessAvgs[h];
+                  return (
+                    <td key={h} className="p-1 text-center">
+                      <div
+                        className={cn(
+                          'rounded-md px-2 py-1.5 text-xs tabular-nums font-semibold',
+                          colorFor(v)
+                        )}
+                        title={v != null ? `${(v * 100).toFixed(1)}%` : 'no data'}
+                      >
+                        {v == null ? '—' : (v * 100).toFixed(1)}
+                      </div>
+                    </td>
+                  );
+                })}
+                <td className="p-1 text-center border-l border-brand-100 dark:border-brand-900 bg-slate-100/70 dark:bg-slate-900">
+                  <div
+                    className={cn(
+                      'rounded-md px-2 py-1.5 text-xs tabular-nums font-bold ring-1 ring-slate-300 dark:ring-slate-700',
+                      colorFor(grandAvg)
+                    )}
+                    title={grandAvg != null ? `${(grandAvg * 100).toFixed(1)}%` : 'no data'}
+                  >
+                    {grandAvg == null ? '—' : (grandAvg * 100).toFixed(1)}
+                  </div>
+                </td>
+              </tr>
+            </tfoot>
           </table>
         </div>
       </div>
@@ -364,6 +419,11 @@ function PivotMatrix({
 
 function Legend({ bg, tx, children }: { bg: string; tx: string; children: React.ReactNode }) {
   return <span className={cn('px-1.5 py-0.5 rounded font-mono text-[10px]', bg, tx)}>{children}</span>;
+}
+
+function mean(vs: number[]): number | null {
+  if (!vs.length) return null;
+  return vs.reduce((a, b) => a + b, 0) / vs.length;
 }
 
 function truncate(s: string, n: number): string {

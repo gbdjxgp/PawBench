@@ -10,6 +10,8 @@ interface Props {
     delta: string;
     avg: string;
     none: string;
+    textOnlyBadge: string;
+    textOnlyNote: string;
   };
 }
 
@@ -17,6 +19,9 @@ function mean(vs: number[]): number | null {
   if (!vs.length) return null;
   return vs.reduce((a, b) => a + b, 0) / vs.length;
 }
+
+// Text-only models whose overall is dragged down by low multimodal scores.
+const TEXT_ONLY_MODELS = new Set(['qwen3.7-max', 'qwen3.6-max-preview', 'glm-5.1']);
 
 function colorFor(v: number | null): string {
   if (v == null) return 'bg-slate-50 dark:bg-slate-900 text-slate-300 dark:text-slate-600';
@@ -34,7 +39,7 @@ export default function HarnessMatrix({ data, labels }: Props) {
   const [hoverModel, setHoverModel] = useState<string | null>(null);
 
   const enriched = useMemo(() => {
-    return rows.map((r) => {
+    const mapped = rows.map((r) => {
       const vals = harnesses
         .map((h) => r[h])
         .filter((v): v is number => typeof v === 'number');
@@ -44,6 +49,7 @@ export default function HarnessMatrix({ data, labels }: Props) {
       const avg = mean(vals);
       return { ...r, _best: best, _delta: delta, _avg: avg };
     });
+    return mapped.sort((a, b) => (b._avg ?? -Infinity) - (a._avg ?? -Infinity));
   }, [rows, harnesses]);
 
   const harnessAvgs = useMemo(() => {
@@ -121,6 +127,14 @@ export default function HarnessMatrix({ data, labels }: Props) {
                 >
                   <td className="px-4 py-2 font-medium text-slate-800 dark:text-slate-200 whitespace-nowrap">
                     {model}
+                    {TEXT_ONLY_MODELS.has(model) && (
+                      <span
+                        title={labels.textOnlyNote}
+                        className="ml-1.5 inline-flex items-center rounded px-1 py-0.5 align-middle text-[10px] font-semibold text-amber-700 dark:text-amber-300 bg-amber-100 dark:bg-amber-950/50 ring-1 ring-amber-200 dark:ring-amber-900 cursor-help"
+                      >
+                        {labels.textOnlyBadge}
+                      </span>
+                    )}
                   </td>
                   {harnesses.map((h) => {
                     const v = typeof r[h] === 'number' ? (r[h] as number) : null;

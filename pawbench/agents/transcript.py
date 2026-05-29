@@ -156,6 +156,11 @@ def _events_from_session_dir(sessions_dir: Path) -> "list[dict[str, Any]]":
     if events:
         return events
 
+    # ── 1b. openclaw plain session JSONL (non-trajectory, openclaw ≥ 2026.x) ──
+    events = _openclaw_session_jsonl_events(sessions_dir)
+    if events:
+        return events
+
     # ── 2 & 3. Session JSON (qwenpaw / openclaw-native / openai-chat) ─────────
     candidates = sorted(
         (p for p in sessions_dir.glob("*.json") if p.is_file()),
@@ -182,6 +187,8 @@ def _events_from_session_dir(sessions_dir: Path) -> "list[dict[str, Any]]":
         if msgs:
             translated = _openai_messages_to_events(msgs)
             if translated:
+                usage = _openai_total_usage_from_trajectory(data)
+                _add_usage_to_last_assistant(translated, usage)
                 return translated
 
     return []
@@ -214,21 +221,41 @@ def _trajectory_jsonl_events(
     return []
 
 
-def _parse_openclaw_trajectory(path: Path) -> "list[dict[str, Any]]":
-    """Parse a single openclaw trajectory JSONL file into transcript events.
+def _openclaw_session_jsonl_events(
+    sessions_dir: Path,
+) -> "list[dict[str, Any]]":
+    """Extract transcript events from plain openclaw session JSONL files.
 
-    Two passes over the file:
-
-    1. Forward pass — collect the first ``context.compiled`` event's
-       ``systemPrompt`` so it can be prepended to the transcript.
-    2. Reverse pass — find the last ``model.completed`` event, which
-       contains the most complete ``messagesSnapshot``.
+    OpenClaw writes one session JSONL per conversation (not a trajectory file).
+    Each line is a JSON object with ``type`` in
+    ``{message, toolCall, toolResult, session}``.  We skip metadata lines
+    (``type=session``) and return the rest as-is, since they are already in
+    the transcript event format consumed by the grader.
     """
-    lines = path.read_text(encoding="utf-8").splitlines()
+    candidates = sorted(
+        (
+            p
+            for p in sessions_dir.glob("*.jsonl")
+            if p.is_file() and not p.name.endswith(".trajectory.jsonl")
+        ),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    for path in candidates:
+        try:
+            events = _parse_openclaw_session_jsonl(path)
+        except Exception:
+            events = []
+        if events:
+            return events
+    return []
 
-    # Pass 1: extract system prompt from the first context.compiled event.
-    system_prompt: str = ""
-    for line in lines:
+
+def _parse_openclaw_session_jsonl(path: Path) -> "list[dict[str, Any]]":
+    """Parse a single openclaw plain session JSONL file into transcript events."""
+    _VALID_TYPES = {"message", "toolCall", "toolResult", "tool_call", "tool_result"}
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -236,14 +263,32 @@ def _parse_openclaw_trajectory(path: Path) -> "list[dict[str, Any]]":
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        if isinstance(obj, dict) and obj.get("type") == "context.compiled":
-            sp = (obj.get("data") or {}).get("systemPrompt")
-            if isinstance(sp, str) and sp.strip():
-                system_prompt = sp.strip()
-            break
+        if not isinstance(obj, dict):
+            continue
+        otype = obj.get("type")
+        if otype == "session":
+            continue  # metadata line, skip
+        if otype in _VALID_TYPES:
+            events.append(obj)
+    return events
 
-    # Pass 2: extract conversation turns from the last model.completed snapshot.
-    for line in reversed(lines):
+
+def _parse_openclaw_trajectory(path: Path) -> "list[dict[str, Any]]":
+    """Parse a single openclaw trajectory JSONL file into transcript events.
+
+    Does a single forward pass over all lines to:
+    * Keep track of the latest ``messagesSnapshot`` (for transcript events).
+    * Accumulate token usage from every ``model.completed`` event (for cost
+      accounting).  Each ``model.completed.data.usage`` dict is normalised via
+      ``_normalize_usage_dict`` so all key styles are handled.
+
+    The accumulated usage is attached to the last assistant event so that
+    ``_extract_usage_from_transcript`` in ``backend.py`` can sum it up.
+    """
+    last_snapshot: "list | None" = None
+    accumulated: dict[str, int] = {}
+
+    for line in path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
             continue
@@ -253,19 +298,19 @@ def _parse_openclaw_trajectory(path: Path) -> "list[dict[str, Any]]":
             continue
         if not isinstance(obj, dict) or obj.get("type") != "model.completed":
             continue
-        snapshot = (obj.get("data") or {}).get("messagesSnapshot")
+        data = obj.get("data") or {}
+        snapshot = data.get("messagesSnapshot")
         if isinstance(snapshot, list) and snapshot:
-            events = _openclaw_snapshot_to_events(snapshot)
-            if events and system_prompt:
-                events.insert(0, {
-                    "type": "message",
-                    "message": {
-                        "role": "system",
-                        "content": [{"type": "text", "text": system_prompt}],
-                    },
-                })
-            return events
-    return []
+            last_snapshot = snapshot
+        usage = _normalize_usage_dict(data.get("usage"))
+        for k, v in usage.items():
+            accumulated[k] = accumulated.get(k, 0) + v
+
+    if not last_snapshot:
+        return []
+    events = _openclaw_snapshot_to_events(last_snapshot)
+    _add_usage_to_last_assistant(events, accumulated)
+    return events
 
 
 def _openclaw_snapshot_to_events(
@@ -446,10 +491,14 @@ def _qwenpaw_native_events(
             content_items.extend(tool_call_items)
 
             if content_items:
-                events.append({
-                    "type": "message",
-                    "message": {"role": "assistant", "content": content_items},
-                })
+                msg_out: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content_items,
+                }
+                usage = _normalize_usage_dict(msg.get("usage"))
+                if usage:
+                    msg_out["usage"] = usage
+                events.append({"type": "message", "message": msg_out})
 
         elif role == "system":
             for b in blocks:
@@ -540,6 +589,36 @@ def _openai_messages_from_trajectory(
         elif isinstance(resp, dict) and resp.get("role"):
             msgs.append(resp)
     return msgs
+
+
+def _openai_total_usage_from_trajectory(
+    session_data: "dict[str, Any]",
+) -> "dict[str, int]":
+    """Accumulate token usage across all entries in ``agent._model_trajectory``.
+
+    Each trajectory entry may expose usage at:
+    * ``entry["usage"]``           — top-level usage for this API call.
+    * ``entry["response"]["usage"]`` — usage embedded in the response object.
+
+    All formats are normalised via ``_normalize_usage_dict``.
+    """
+    if not isinstance(session_data, dict):
+        return {}
+    agent = session_data.get("agent")
+    if not isinstance(agent, dict):
+        return {}
+    accumulated: dict[str, int] = {}
+    for entry in agent.get("_model_trajectory") or []:
+        if not isinstance(entry, dict):
+            continue
+        for usage_source in (
+            entry.get("usage"),
+            entry.get("response", {}).get("usage") if isinstance(entry.get("response"), dict) else None,
+        ):
+            usage = _normalize_usage_dict(usage_source)
+            for k, v in usage.items():
+                accumulated[k] = accumulated.get(k, 0) + v
+    return accumulated
 
 
 def _openai_messages_to_events(
@@ -683,3 +762,56 @@ def _normalize_tool_call(tc: Any) -> "tuple[str, dict[str, Any]] | None":
     if not name:
         return None
     return name, _parse_tool_args(raw_args)
+
+
+# ── token-usage helpers ───────────────────────────────────────────────────────
+
+def _normalize_usage_dict(raw: "Any") -> "dict[str, int]":
+    """Normalize token-usage data from any known API format to a canonical dict.
+
+    Recognised key styles:
+    * OpenAI snake_case   – ``prompt_tokens``   / ``completion_tokens``
+    * Anthropic snake_case – ``input_tokens``    / ``output_tokens``
+    * OpenClaw camelCase  – ``inputTokens``      / ``outputTokens``
+
+    Returns ``{}`` when no positive token counts are found.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    prompt = (
+        raw.get("prompt_tokens") or
+        raw.get("input_tokens") or
+        raw.get("inputTokens") or
+        0
+    )
+    completion = (
+        raw.get("completion_tokens") or
+        raw.get("output_tokens") or
+        raw.get("outputTokens") or
+        0
+    )
+    try:
+        p, c = int(prompt), int(completion)
+    except (TypeError, ValueError):
+        return {}
+    return {"prompt_tokens": p, "completion_tokens": c} if (p or c) else {}
+
+
+def _add_usage_to_last_assistant(
+    events: "list[dict[str, Any]]",
+    usage: "dict[str, int]",
+) -> None:
+    """Attach *usage* in-place to the last assistant event in *events*.
+
+    Used by parsers that accumulate per-session usage (e.g. openclaw
+    trajectory) and want to make it accessible to
+    ``_extract_usage_from_transcript`` without changing any return signatures.
+    No-op when *usage* is empty or no assistant event is found.
+    """
+    if not usage:
+        return
+    for ev in reversed(events):
+        msg = ev.get("message")
+        if isinstance(msg, dict) and msg.get("role") == "assistant":
+            msg["usage"] = usage
+            return

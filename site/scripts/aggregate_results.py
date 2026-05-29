@@ -151,27 +151,174 @@ def discover_runs(only: list[str] | None) -> list[Path]:
     return runs
 
 
-def aggregate_pair(
-    run_dir: Path,
-    model_dir: Path,
-    harness_dir: Path,
+def _record_task(
+    *,
+    t_id: str | None,
+    score: float,
+    grading_type: str,
+    breakdown: dict[str, float],
+    status: str,
     task_meta: dict[str, dict[str, Any]],
-) -> dict[str, Any] | None:
-    """Aggregate a single ``(run, model, harness)`` triple."""
-    metrics_files = sorted(harness_dir.glob("T*/output/metrics.json"))
-    if not metrics_files:
-        return None
+    per_task_score: list[float],
+    automated_scores: list[float],
+    judge_scores: list[float],
+    buckets: dict[str, dict[str, list[float]]],
+) -> tuple[int, int]:
+    """Apply a single task result to the running aggregates.
 
-    per_task_score: list[float] = []
-    automated_scores: list[float] = []
-    judge_scores: list[float] = []
+    Returns ``(errored, missing_meta)`` deltas (0 or 1 each) so the caller
+    can keep cumulative counters.
+    """
     errored = 0
     missing_meta = 0
 
-    # bucket → list of task scores (errors counted as 0)
-    buckets: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    if grading_type == "error" or status == "error":
+        errored = 1
+        score = 0.0  # ensure error tasks count as 0 toward all means
+    else:
+        a, j = score_partition(grading_type, score, breakdown)
+        if a is not None:
+            automated_scores.append(a)
+        if j is not None:
+            judge_scores.append(j)
 
-    seen_ids: set[str] = set()
+    per_task_score.append(score)
+
+    meta = task_meta.get(t_id) if t_id else None
+    if meta is None:
+        return errored, missing_meta + 1
+
+    labels = meta.get("labels") or {}
+    if labels.get("complexity"):
+        buckets["by_complexity"][labels["complexity"]].append(score)
+    if labels.get("environment"):
+        buckets["by_environment"][labels["environment"]].append(score)
+    if labels.get("scenario"):
+        sc = labels["scenario"]
+        buckets["by_scenario"][sc].append(score)
+        buckets["by_scenario_top"][sc.split("/", 1)[0]].append(score)
+    modality = labels.get("modality") or {}
+    if modality.get("type"):
+        buckets["by_modality"][modality["type"]].append(score)
+    for ch in modality.get("channels") or []:
+        buckets["by_channel"][ch].append(score)
+    for cap in labels.get("capabilities") or []:
+        buckets["by_capability"][cap].append(score)
+    if meta.get("source_dataset"):
+        buckets["by_source"][meta["source_dataset"]].append(score)
+    if meta.get("category"):
+        buckets["by_category"][meta["category"]].append(score)
+    if meta.get("subcategory"):
+        buckets["by_subcategory"][meta["subcategory"]].append(score)
+    # use the *task's* original grading_type (from md), not the run-time
+    # grading_type which may be ``error``
+    orig_gt = meta.get("grading_type")
+    if orig_gt:
+        buckets["by_grading"][orig_gt].append(score)
+
+    return errored, missing_meta
+
+
+def _build_task_name_index(
+    task_meta: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    """Map normalised task display name → t_id for fallback lookups.
+
+    Used for the hermes single-summary format whose ``task_id`` field uses
+    internal hermes slugs that don't match our ``t_id`` system. ``task_name``
+    matches our ``name`` field exactly.
+    """
+    index: dict[str, str] = {}
+    for t_id, meta in task_meta.items():
+        name = (meta.get("name") or "").strip().lower()
+        if name:
+            index[name] = t_id
+    return index
+
+
+def _build_task_slug_index(
+    task_meta: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    """Map hermes ``task_id`` slugs (``core_id`` / ``task_id``) → ``t_id``."""
+    index: dict[str, str] = {}
+    for t_id, meta in task_meta.items():
+        index[t_id.lower()] = t_id
+        for key in ("core_id", "task_id"):
+            slug = (meta.get(key) or "").strip().lower()
+            if slug:
+                index[slug] = t_id
+        fn = (meta.get("filename") or "").strip()
+        if fn.endswith(".md"):
+            _prefix, sep, tail = fn[:-3].partition("_")
+            if sep and tail:
+                index[tail.lower()] = t_id
+    return index
+
+
+def _resolve_t_id_from_hermes_result(
+    r: dict[str, Any],
+    name_to_tid: dict[str, str],
+    slug_to_tid: dict[str, str],
+) -> str | None:
+    name_key = (r.get("task_name") or "").strip().lower()
+    if name_key and name_key in name_to_tid:
+        return name_to_tid[name_key]
+    slug = (r.get("task_id") or "").strip().lower()
+    if slug and slug in slug_to_tid:
+        return slug_to_tid[slug]
+    # Some hermes exports use ``T042``-style ids in ``task_id``.
+    if slug and slug.upper() in slug_to_tid:
+        return slug_to_tid[slug.upper()]
+    return None
+
+
+def _is_pawbench_metrics(doc: dict[str, Any]) -> bool:
+    """True when ``metrics.json`` follows the standard per-task layout."""
+    return isinstance(doc, dict) and "task_score" in doc
+
+
+def _find_hermes_summary(harness_dir: Path) -> Path | None:
+    """Pick the hermes roll-up JSON under ``<harness>/`` (not ``workspaces/``)."""
+    best: tuple[int, Path] | None = None
+    for sf in sorted(harness_dir.glob("*.json")):
+        try:
+            head = json.loads(sf.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(head, dict):
+            continue
+        results = head.get("results")
+        if not isinstance(results, list) or not results:
+            continue
+        n = len(results)
+        if best is None or n > best[0]:
+            best = (n, sf)
+    return best[1] if best else None
+
+
+def _discover_per_task_metrics(harness_dir: Path) -> list[Path]:
+    """``T*/output/metrics.json`` files that contain pawbench ``task_score``."""
+    out: list[Path] = []
+    for mp in sorted(harness_dir.glob("T*/output/metrics.json")):
+        try:
+            doc = json.loads(mp.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if _is_pawbench_metrics(doc):
+            out.append(mp)
+    return out
+
+
+def _aggregate_from_per_task_dirs(
+    metrics_files: list[Path],
+    task_meta: dict[str, dict[str, Any]],
+    per_task_score: list[float],
+    automated_scores: list[float],
+    judge_scores: list[float],
+    buckets: dict[str, dict[str, list[float]]],
+) -> tuple[int, int]:
+    errored = 0
+    missing_meta = 0
     for mp in metrics_files:
         try:
             d = json.loads(mp.read_text(encoding="utf-8"))
@@ -179,60 +326,143 @@ def aggregate_pair(
             print(f"[aggregate_results] skip {mp}: {exc}", file=sys.stderr)
             continue
 
-        # Use the directory name as the canonical t-id source; fall back to the
-        # ``instance_id`` or the dir prefix when missing.
+        # Use the directory name as the canonical t-id source.
         t_id = mp.parent.parent.name.split("_", 1)[0]
-        seen_ids.add(t_id)
+        de, dm = _record_task(
+            t_id=t_id,
+            score=float(d.get("task_score") or 0.0),
+            grading_type=d.get("grading_type") or "unknown",
+            breakdown=d.get("breakdown") or {},
+            status=d.get("status") or "",
+            task_meta=task_meta,
+            per_task_score=per_task_score,
+            automated_scores=automated_scores,
+            judge_scores=judge_scores,
+            buckets=buckets,
+        )
+        errored += de
+        missing_meta += dm
+    return errored, missing_meta
 
-        score = float(d.get("task_score") or 0.0)
-        gt = d.get("grading_type") or "unknown"
-        breakdown = d.get("breakdown") or {}
 
-        if gt == "error" or d.get("status") == "error":
-            errored += 1
-            score = 0.0  # ensure error tasks count as 0 toward all means
-        else:
-            a, j = score_partition(gt, score, breakdown)
-            if a is not None:
-                automated_scores.append(a)
-            if j is not None:
-                judge_scores.append(j)
+def _aggregate_from_single_summary(
+    summary_file: Path,
+    task_meta: dict[str, dict[str, Any]],
+    per_task_score: list[float],
+    automated_scores: list[float],
+    judge_scores: list[float],
+    buckets: dict[str, dict[str, list[float]]],
+) -> tuple[int, int]:
+    """Parse hermes' single-file summary format.
 
-        per_task_score.append(score)
+    Schema (one JSON per ``<harness_dir>/<timestamp>.json``)::
 
-        meta = task_meta.get(t_id)
-        if meta is None:
-            missing_meta += 1
-            continue
+        {
+          "summary": {...},
+          "results": [
+            {"task_id": "...", "task_name": "...",
+             "score": float, "max_score": float, "passed": bool,
+             "grading_type": "hybrid|automated|llm_judge|error",
+             "breakdown": {...}, "status": "success|error|timeout",
+             "timed_out": bool, "labels": {...}},
+            ...
+          ]
+        }
 
-        labels = meta.get("labels") or {}
-        # single-valued buckets
-        if labels.get("complexity"):
-            buckets["by_complexity"][labels["complexity"]].append(score)
-        if labels.get("environment"):
-            buckets["by_environment"][labels["environment"]].append(score)
-        if labels.get("scenario"):
-            sc = labels["scenario"]
-            buckets["by_scenario"][sc].append(score)
-            buckets["by_scenario_top"][sc.split("/", 1)[0]].append(score)
-        modality = labels.get("modality") or {}
-        if modality.get("type"):
-            buckets["by_modality"][modality["type"]].append(score)
-        for ch in modality.get("channels") or []:
-            buckets["by_channel"][ch].append(score)
-        for cap in labels.get("capabilities") or []:
-            buckets["by_capability"][cap].append(score)
-        if meta.get("source_dataset"):
-            buckets["by_source"][meta["source_dataset"]].append(score)
-        if meta.get("category"):
-            buckets["by_category"][meta["category"]].append(score)
-        if meta.get("subcategory"):
-            buckets["by_subcategory"][meta["subcategory"]].append(score)
-        # use the *task's* original grading_type (from md), not the run-time
-        # grading_type which may be ``error``
-        orig_gt = meta.get("grading_type")
-        if orig_gt:
-            buckets["by_grading"][orig_gt].append(score)
+    The ``task_id`` field uses internal hermes slugs that don't match our
+    ``t_id`` system, so we map back via ``task_name`` against ``tasks.json``.
+    """
+    try:
+        d = json.loads(summary_file.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        print(f"[aggregate_results] skip {summary_file}: {exc}", file=sys.stderr)
+        return 0, 0
+
+    results = d.get("results") or []
+    if not results:
+        return 0, 0
+
+    name_to_tid = _build_task_name_index(task_meta)
+    slug_to_tid = _build_task_slug_index(task_meta)
+    errored = 0
+    missing_meta = 0
+    for r in results:
+        # ``score`` is the canonical 0-1 task score for hermes; fall back to
+        # ``task_score`` for safety in case the schema evolves.
+        score = float(r.get("score") if r.get("score") is not None else r.get("task_score") or 0.0)
+        status = r.get("status") or ""
+        if r.get("timed_out") and status not in {"error", "timeout"}:
+            # treat timeouts as errors for accounting parity with the
+            # per-task-dir format
+            status = "error"
+
+        t_id = _resolve_t_id_from_hermes_result(r, name_to_tid, slug_to_tid)
+
+        de, dm = _record_task(
+            t_id=t_id,
+            score=score,
+            grading_type=r.get("grading_type") or "unknown",
+            breakdown=r.get("breakdown") or {},
+            status=status,
+            task_meta=task_meta,
+            per_task_score=per_task_score,
+            automated_scores=automated_scores,
+            judge_scores=judge_scores,
+            buckets=buckets,
+        )
+        errored += de
+        missing_meta += dm
+    return errored, missing_meta
+
+
+def aggregate_pair(
+    run_dir: Path,
+    model_dir: Path,
+    harness_dir: Path,
+    task_meta: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Aggregate a single ``(run, model, harness)`` triple.
+
+    Tries two on-disk layouts:
+
+    1. Per-task directories with ``T*/output/metrics.json`` (the default
+       hermes/openclaw/qwenpaw layout).
+    2. A single ``<timestamp>.json`` summary file directly under the harness
+       directory (used by some hermes runs, e.g.
+       ``result/.../openai.claude-opus-4-6/hermes/20260525_115007.json``).
+    """
+    per_task_score: list[float] = []
+    automated_scores: list[float] = []
+    judge_scores: list[float] = []
+
+    # bucket → list of task scores (errors counted as 0)
+    buckets: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+
+    metrics_files = _discover_per_task_metrics(harness_dir)
+    summary_file = _find_hermes_summary(harness_dir)
+
+    if metrics_files:
+        errored, missing_meta = _aggregate_from_per_task_dirs(
+            metrics_files,
+            task_meta,
+            per_task_score,
+            automated_scores,
+            judge_scores,
+            buckets,
+        )
+    elif summary_file is not None:
+        # Hermes roll-up export (e.g. ``openai.claude-opus-4-6/hermes/<ts>.json``)
+        # with ``results[]`` instead of per-task ``T*/output/metrics.json``.
+        errored, missing_meta = _aggregate_from_single_summary(
+            summary_file,
+            task_meta,
+            per_task_score,
+            automated_scores,
+            judge_scores,
+            buckets,
+        )
+    else:
+        return None
 
     if not per_task_score:
         return None

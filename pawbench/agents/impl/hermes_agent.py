@@ -2,6 +2,7 @@
 """Hermes agent implementation for pawbench evaluation."""
 
 import json
+import os
 import secrets
 import shlex
 import time
@@ -13,7 +14,7 @@ import yaml
 from pawbench.agents.base import ContainerAgent
 from pawbench.agents.constants import AGENT_WORKSPACE
 from pawbench.envs.base import BaseEnvironment
-from pawbench.llm.model_config import get_model_config, ModelConfig, ProviderType, ResolvedModelConfig
+from pawbench.llm.model_config import get_model_config, ModelConfig, ProviderType
 
 
 _HERMES_VERSION = "2026.4.23"
@@ -120,27 +121,53 @@ class HermesAgent(ContainerAgent):
         config_prov = _CONFIG_PROVIDER_MAP.get(provider, "custom")
         return config_prov if config_prov in _CLI_PROVIDER_CHOICES else None
 
-    def _build_config(self, rc: ResolvedModelConfig) -> Dict[str, Any]:
+    def _build_config(
+        self, model_config: ModelConfig, *, explicit_base_url: bool = False
+    ) -> Dict[str, Any]:
         """Build a valid hermes config.yaml dict.
 
         Rules (from hermes_cli/config.py _KNOWN_ROOT_KEYS and runtime_provider.py):
-        - Valid root keys: _config_version, model, providers, agent, terminal, ...
-        - model: string or dict; dict fields: default, provider, base_url, api_mode
+        - Valid root keys: _config_version, model, providers, agent, terminal, workspace
+        - model: string or dict; dict fields: default, provider, base_url, api_mode,
+          max_tokens
+        - agent: dict fields: max_turns
         - terminal.cwd: sets the working directory for every terminal tool call
+        - workspace: root dir for write_file tool (must match AGENT_WORKSPACE so
+          the grader can find output files via collect_workspace)
         - --yolo on CLI handles approval bypass; no "approvals" key in config
         """
-        config_prov = self._config_provider(rc.model_config.provider)
+        config_prov = self._config_provider(model_config.provider)
         max_turns = int(self.config.get("max_turns", 90))
+
+        # hermes v2026.4.x hardcodes the API endpoint for native providers
+        # ("anthropic" → api.anthropic.com, "gemini" → generativelanguage.googleapis.com)
+        # and ignores both ANTHROPIC_BASE_URL env var and model.base_url in config.yaml
+        # for those providers.  When the caller provides an explicit custom base_url,
+        # fall back to the "custom" (OpenAI-compatible) provider so hermes uses the
+        # configured endpoint instead of its hardcoded default.
+        if explicit_base_url and model_config.base_url and config_prov in ("anthropic", "gemini"):
+            config_prov = "custom"
+            # OpenAI SDK expects the base_url to end with /v1; normalise if missing.
+            url = model_config.base_url.rstrip("/")
+            if not url.endswith("/v1"):
+                model_config.base_url = url + "/v1"
 
         model_section: Dict[str, Any] = {
             "provider": config_prov,
-            "default":  rc.model_config.model_name,
+            "default":  model_config.model_name,
         }
         # "custom" provider requires base_url in config.yaml so hermes knows
-        # which endpoint to call.  Native providers (anthropic, gemini) use
-        # hardcoded defaults or their own env-var overrides.
-        if config_prov == "custom" and rc.base_url:
-            model_section["base_url"] = rc.base_url
+        # which endpoint to call.
+        if model_config.base_url:
+            model_section["base_url"] = model_config.base_url
+
+        # Set a generous max_tokens so the model can generate complete responses
+        # including tool calls without hitting a truncation limit.  Claude Opus
+        # with extended thinking can consume many tokens internally; a low default
+        # (e.g. 4096) can cause the second+ LLM call to return an empty response,
+        # making hermes terminate the session prematurely.
+        max_tokens = int(self.config.get("max_tokens", 16000))
+        model_section["max_tokens"] = max_tokens
 
         return {
             "_config_version": 1,
@@ -151,26 +178,46 @@ class HermesAgent(ContainerAgent):
             "terminal": {
                 "cwd": AGENT_WORKSPACE,   # hermes terminal tool initial directory
             },
+            "workspace": AGENT_WORKSPACE,  # write_file root — must match benchmark workspace
         }
 
-    def _build_dotenv(self, rc: ResolvedModelConfig) -> str:
+    def _build_dotenv(
+        self,
+        api_key: str,
+        model_config: ModelConfig,
+        *,
+        explicit_base_url: bool = False,
+        is_custom_fallback: bool = False,
+    ) -> str:
         """Build ~/.hermes/.env content.
 
         Only writes the env var that hermes actually reads for this provider.
         The base URL override env var (e.g. ANTHROPIC_BASE_URL) is written only
-        when the caller explicitly configured a non-default URL, so hermes falls
-        back to its own hardcoded default for native providers (anthropic, gemini).
-        """
-        provider = rc.model_config.provider
-        key_var = _PROVIDER_KEY_ENV.get(provider, "OPENAI_API_KEY")
-        lines = [f"{key_var}={rc.api_key}"]
+        when the caller explicitly configured a custom URL — not when it's the
+        pawbench default — so hermes falls back to its own hardcoded default
+        for native providers (anthropic, gemini).
 
-        # Write base URL override env var only for providers that use env-var
-        # routing (anthropic, gemini).  For "custom" the URL is in config.yaml
-        # model.base_url, so no env var is needed.
+        When ``is_custom_fallback`` is True the provider was downgraded to
+        "custom" in config.yaml (because hermes ignores base_url for native
+        providers), so we also write OPENAI_API_KEY which is what the hermes
+        "custom" provider path reads.
+        """
+        provider = model_config.provider
+        key_var = _PROVIDER_KEY_ENV.get(provider, "OPENAI_API_KEY")
+        lines = [f"{key_var}={api_key}"]
+
+        # custom-fallback path: hermes reads OPENAI_API_KEY for the "custom"
+        # provider; write it alongside the native key so either path works.
+        if is_custom_fallback and key_var != "OPENAI_API_KEY":
+            lines.append(f"OPENAI_API_KEY={api_key}")
+
+        # Write base URL override env var for providers that use env-var routing
+        # (anthropic, gemini) — skipped for custom (URL is in config.yaml).
+        # In the fallback case the base_url already has /v1 appended, but that's
+        # harmless since these env vars won't be read by hermes for "custom".
         url_env = _PROVIDER_BASE_URL_ENV.get(provider)
-        if rc.explicit_base_url and url_env and rc.base_url:
-            lines.append(f"{url_env}={rc.base_url}")
+        if explicit_base_url and url_env and model_config.base_url:
+            lines.append(f"{url_env}={model_config.base_url}")
 
         return "\n".join(lines) + "\n"
 
@@ -218,27 +265,58 @@ class HermesAgent(ContainerAgent):
 
     async def run(self, instruction: str, environment: BaseEnvironment) -> Dict[str, Any]:
         model_identifier = self.config.get("model", "dashscope/qwen3.6-plus")
-        rc = get_model_config(model_identifier).resolve_with(self.config)
-        model_config = rc.model_config
+        model_config = get_model_config(model_identifier)
+        api_key = (
+            self.config.get("api_key")
+            or model_config.api_key
+            or os.environ.get(_PROVIDER_KEY_ENV.get(model_config.provider, "OPENAI_API_KEY"), "")
+        )
+        # Allow explicit base_url override from pawbench config.
+        explicit_base_url = bool(self.config.get("base_url"))
+        if explicit_base_url:
+            model_config.base_url = self.config["base_url"]
+
+        # Detect whether _build_config will fall back from a native provider
+        # (anthropic/gemini) to "custom" because hermes hardcodes its default
+        # endpoint for those providers and ignores base_url in config.yaml.
+        _orig_config_prov = self._config_provider(model_config.provider)
+        is_custom_fallback = (
+            explicit_base_url
+            and bool(model_config.base_url)
+            and _orig_config_prov in ("anthropic", "gemini")
+        )
 
         # Write per-task config.yaml and .env.
         await environment.write_file(
             "/root/.hermes/config.yaml",
             yaml.dump(
-                self._build_config(rc),
+                self._build_config(model_config, explicit_base_url=explicit_base_url),
                 default_flow_style=False,
                 allow_unicode=True,
             ),
         )
         await environment.write_file(
             "/root/.hermes/.env",
-            self._build_dotenv(rc),
+            self._build_dotenv(
+                api_key,
+                model_config,
+                explicit_base_url=explicit_base_url,
+                is_custom_fallback=is_custom_fallback,
+            ),
         )
 
         # Reset session state before each task.
         await self._reset_hermes_state(environment)
 
-        cli_provider = self._cli_provider(model_config.provider)
+        # When falling back to "custom" provider, do not pass --provider on the
+        # CLI: the "custom" provider is not in hermes v0.11.0's --provider
+        # choices, and passing the original native provider flag (e.g.
+        # --provider anthropic) would override config.yaml and re-enable the
+        # hardcoded default endpoint.
+        if is_custom_fallback:
+            cli_provider = None
+        else:
+            cli_provider = self._cli_provider(model_config.provider)
         inner_timeout = int(self.config.get("task_timeout_s") or 1800)
         session_id = f"pawbench-{int(time.time() * 1000)}"
 
@@ -259,7 +337,6 @@ class HermesAgent(ContainerAgent):
             f"--yolo "
             f"{provider_flag}"
             f"--model {shlex.quote(model_config.model_name)} "
-            f"--ignore-rules "
             f"> /tmp/hermes_output.txt 2>&1 || true"
         )
         result = await environment.execute_command(run_cmd, timeout=inner_timeout + 70)
@@ -323,6 +400,7 @@ class HermesAgent(ContainerAgent):
     # session from ``~/.hermes/state.db`` and emits a JSON list of OpenAI-style
     # rows on stdout.  Hermes 2026.4.x persists the full multi-turn trajectory
     # (including tool_calls / reasoning_content) in this DB.
+    # Uses dynamic schema discovery to handle different hermes versions.
     _SQLITE_DUMP_SCRIPT = '''
 import json, os, sqlite3, sys
 
@@ -337,22 +415,46 @@ except Exception:
     conn = sqlite3.connect(db_path)
 conn.row_factory = sqlite3.Row
 try:
-    sess = conn.execute(
-        "SELECT id FROM sessions ORDER BY started_at DESC LIMIT 1"
-    ).fetchone()
-    if not sess:
-        print("[]")
-        sys.exit(0)
+    # Dynamic schema discovery — handles different hermes versions
+    tables = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type=\'table\'"
+    )}
 
-    cols = {row[1] for row in conn.execute("PRAGMA table_info(messages)")}
-    select = ["role", "content", "tool_call_id", "tool_calls", "tool_name", "timestamp"]
-    for opt in ("finish_reason", "reasoning", "reasoning_content"):
-        if opt in cols:
-            select.append(opt)
+    sess_table = next((t for t in ("sessions", "session", "chat_sessions") if t in tables), None)
+    if not sess_table:
+        print("[]"); sys.exit(0)
+
+    sess_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({sess_table})")}
+    id_col = next((c for c in ("id", "session_id", "sid") if c in sess_cols), None)
+    ts_col = next((c for c in ("started_at", "created_at", "timestamp", "ts") if c in sess_cols), None)
+    if not id_col:
+        print("[]"); sys.exit(0)
+
+    order_clause = f"ORDER BY {ts_col} DESC" if ts_col else ""
+    sess = conn.execute(f"SELECT {id_col} FROM {sess_table} {order_clause} LIMIT 1").fetchone()
+    if not sess:
+        print("[]"); sys.exit(0)
+    sess_id = sess[0]
+
+    msg_table = next((t for t in ("messages", "message", "chat_messages") if t in tables), None)
+    if not msg_table:
+        print("[]"); sys.exit(0)
+
+    msg_cols = {r[1] for r in conn.execute(f"PRAGMA table_info({msg_table})")}
+    fk_col = next((c for c in ("session_id", "sess_id", "session", "chat_session_id") if c in msg_cols), None)
+    if not fk_col:
+        print("[]"); sys.exit(0)
+
+    want = ["role", "content", "tool_call_id", "tool_calls", "tool_name", "timestamp"]
+    extra = ["finish_reason", "reasoning", "reasoning_content"]
+    select = [c for c in want + extra if c in msg_cols]
+    order_m = next((c for c in ("timestamp", "ts", "created_at", "id") if c in msg_cols), None)
+    order_m_clause = f"ORDER BY {order_m}" if order_m else ""
+
     rows = conn.execute(
-        f"SELECT {', '.join(select)} FROM messages "
-        f"WHERE session_id = ? ORDER BY timestamp, id",
-        (sess["id"],),
+        f"SELECT {\', \'.join(select)} FROM {msg_table} "
+        f"WHERE {fk_col} = ? {order_m_clause}",
+        (sess_id,),
     ).fetchall()
 
     msgs = []
@@ -385,7 +487,12 @@ finally:
     async def _dump_hermes_session_messages(
         cls, environment: BaseEnvironment
     ) -> List[Dict[str, Any]]:
-        """Pull the latest hermes session from ``~/.hermes/state.db``."""
+        """Pull the latest hermes session from ``~/.hermes/state.db``.
+
+        Returns ``[]`` if the DB doesn't exist, has no sessions, or the dump
+        fails.  Falls back to ``hermes history --format json`` when the DB
+        dump returns empty.
+        """
         await environment.write_file("/tmp/hermes_session_dump.py", cls._SQLITE_DUMP_SCRIPT)
         r = await environment.execute_command(
             "python3 /tmp/hermes_session_dump.py", timeout=30
@@ -397,7 +504,23 @@ finally:
             data = json.loads(raw)
         except (json.JSONDecodeError, ValueError):
             return []
-        return data if isinstance(data, list) else []
+        if isinstance(data, list) and data:
+            return data
+
+        # state.db dump returned empty — try `hermes history` CLI as fallback
+        hist_r = await environment.execute_command(
+            "hermes history --format json 2>/dev/null | head -c 524288 || true",
+            timeout=20,
+        )
+        hist_raw = (hist_r.get("stdout") or "").strip()
+        if hist_raw:
+            try:
+                hist_data = json.loads(hist_raw)
+                if isinstance(hist_data, list) and hist_data:
+                    return hist_data
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return []
 
     @classmethod
     def _build_openclaw_events(
@@ -833,9 +956,42 @@ __PYEOF__
         sp_text = (sp_result.get("stdout") or "").strip()
         self._last_system_prompt: "str | None" = sp_text if sp_text else None
 
+        # Sync hermes internal workspace to the standard benchmark path so the
+        # grader can find output files via collect_workspace().
+        # hermes write_file writes to its own workspace dir (e.g.
+        # ~/.hermes/workspaces/default/) even when workspace: is set in config.
+        # Explicitly mirror all non-bytecode files from every known hermes
+        # workspace location into AGENT_WORKSPACE before the backend snapshots it.
+        _SYNC_CMD = rf"""
+DEST={AGENT_WORKSPACE}
+mkdir -p "$DEST/output"
+for src_dir in ~/.hermes/workspaces/default /root/.hermes/workspaces/default; do
+  [ -d "$src_dir" ] || continue
+  find "$src_dir" -maxdepth 5 -type f \
+      ! -path '*/site-packages/*' ! -name '*.pyc' \
+      2>/dev/null | while read -r f; do
+    rel="${{f#${{src_dir}}/}}"
+    dest="$DEST/$rel"
+    mkdir -p "$(dirname "$dest")"
+    [ ! -s "$dest" ] && [ -s "$f" ] && cp "$f" "$dest" 2>/dev/null || true
+  done
+done
+"""
+        await environment.execute_command(_SYNC_CMD, timeout=30)
+
     # ── teardown ──────────────────────────────────────────────────────────────
 
     async def teardown(self, environment: BaseEnvironment) -> None:
+        # Copy hermes CLI output to the workspace BEFORE deleting it so it
+        # is captured as an artifact.  This is invaluable for diagnosing
+        # premature-session-termination failures (the output shows exactly
+        # what hermes printed, including any error messages from the LLM loop).
+        await environment.execute_command(
+            f"[ -f /tmp/hermes_output.txt ] && "
+            f"cp /tmp/hermes_output.txt {AGENT_WORKSPACE}/hermes_output.txt "
+            f"|| true",
+            timeout=10,
+        )
         await environment.execute_command(
             "rm -f /tmp/hermes_output.txt /tmp/hermes_session_dump.py",
             timeout=10,

@@ -5,7 +5,7 @@ import json
 import os
 import shlex
 import time
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from pawbench.agents.base import ContainerAgent
 from pawbench.agents.constants import AGENT_WORKSPACE
@@ -39,7 +39,8 @@ class OpenClawAgent(ContainerAgent):
         openclaw's first-party DashScope integration (``extensions/qwen/``) uses
         ``"qwen"`` as the canonical provider ID.  Mapping ``dashscope/model`` →
         ``qwen/model`` ensures the model reference matches the provider key we
-        write into ``openclaw.json``.
+        write into ``openclaw.json``, so the gateway can resolve the agent's model
+        at startup instead of returning ``unknown agent id``.
         """
         parts = model_identifier.split("/", 1)
         if len(parts) == 2:
@@ -48,6 +49,14 @@ class OpenClawAgent(ContainerAgent):
             if provider_str == "dashscope":
                 return f"qwen/{model_name}"
         return model_identifier
+
+    def _resolve_api_key(self, model_config=None) -> str:
+        return (
+            self.config.get("api_key")
+            or (model_config.api_key if model_config else None)
+            or os.environ.get("DASHSCOPE_API_KEY", "")
+            or os.environ.get("OPENAI_API_KEY", "")
+        ) or ""
 
     # ── installation ──────────────────────────────────────────────────────────
 
@@ -81,39 +90,59 @@ class OpenClawAgent(ContainerAgent):
             timeout=15,
         )
 
-        model_identifier = self.config.get("model", "dashscope/qwen3.6-plus")
-        rc = get_model_config(model_identifier).resolve_with(self.config)
-        api_key = rc.api_key
-        base_url = rc.base_url
+        # Wipe the auth profile baked into the image by ``openclaw onboard``
+        # in Dockerfile.pawbench-openclaw (Step "Pre-configure openclaw for
+        # Alibaba Dashscope"), which stores the placeholder key
+        # ``sk-build-placeholder``.  If left in place, the built-in qwen
+        # plugin loads that profile at gateway startup and serves it as the
+        # active credential for any qwen/<model> request — bypassing the
+        # apiKey we write into openclaw.json and producing
+        # "401 Incorrect API key".  We also disable the qwen plugin in
+        # ``_configure_openclaw_json`` below; this cleanup is the
+        # belt-and-suspenders companion to that, ensuring no stale profile
+        # gets re-discovered by a future plugin scan.
+        await environment.execute_command(
+            "rm -f /root/.openclaw/auth-profiles.json "
+            "      /root/.openclaw/auth/profiles.json "
+            "      /root/.openclaw/auth/*.json 2>/dev/null || true",
+            timeout=10,
+        )
 
-        # Write provider + model configuration into openclaw.json once so
-        # every subsequent openclaw invocation (gateway, agents add, agent run)
-        # uses consistent settings without further patching.
+        model_identifier = self.config.get("model", "dashscope/qwen3.6-plus")
+        model_config = get_model_config(model_identifier)
+        api_key = self._resolve_api_key(model_config)
+        base_url = self.config.get("base_url") or model_config.base_url or ""
+        provider_str = (
+            model_identifier.split("/", 1)[0].lower()
+            if "/" in model_identifier else "openai"
+        )
+
+        # Seed openclaw.json before agents add (CLI reads it even without gateway).
         await self._configure_openclaw_json(
             environment,
             api_key=api_key,
             base_url=base_url,
             model_identifier=model_identifier,
+            explicit_base_url=bool(self.config.get("base_url")),
         )
 
-        # NOTE: _stabilise_gateway_plugins() — disable bonjour + run
-        # ``openclaw doctor --fix`` — is currently disabled.  The fix is
-        # validated in isolation but the in-benchmark integration still
-        # leaves the gateway in a half-dead state on some tasks; pausing
-        # the call here while we investigate.  The method body is preserved
-        # below so we can re-enable it with a single line.
-
-        await self._ensure_gateway(environment, api_key=api_key)
+        # Kill any gateway BEFORE agents add / config patches.
+        #
+        # Root cause of EADDRINUSE + PluginLoadFailureError:
+        #   1. Starting gateway, then running ``agents add``, rewrites openclaw.json.
+        #   2. The gateway's config watcher hot-reloads and may spawn a second listener.
+        #   3. setup() then tries to start another gateway → EADDRINUSE on 18789.
+        #
+        # Fix (matches examples/open_source openclaw_agent): no gateway during
+        # config writes; start exactly once after all patches are on disk.
+        await self._kill_gateway(environment)
 
         # Create (or recreate) the named bench agent so its workspace and
         # model are explicitly bound.  Deleting first guarantees no stale
         # config from a previous run leaks into the new task.
         agent_id = self._agent_id()
         openclaw_model = self._openclaw_model_id(model_identifier)
-        env_prefix = (
-            f"export QWEN_API_KEY={shlex.quote(api_key)} "
-            f"DASHSCOPE_API_KEY={shlex.quote(api_key)} && "
-        )
+        env_prefix = self._make_key_env(provider_str, api_key)
         # NOTE: The first openclaw CLI invocation in a fresh container installs
         # all plugin runtime dependencies (~26 s).  Timeouts here must exceed
         # that warm-up cost; subsequent invocations reuse the cached deps and
@@ -142,10 +171,20 @@ class OpenClawAgent(ContainerAgent):
                 (add_result.get("stderr") or "")[:500],
             )
 
+        # Point openclaw's global default workspace at the benchmark path so
+        # the ACPX runtime routes all file I/O there.  ``agents add --workspace``
+        # only sets per-agent metadata; this config key controls where write/read
+        # operations actually land.
+        await environment.execute_command(
+            f"{env_prefix}"
+            f"openclaw config set agents.defaults.workspace {shlex.quote(AGENT_WORKSPACE)} "
+            "2>/dev/null || true",
+            timeout=15,
+        )
+
         # ``agents add`` rewrites openclaw.json and may drop fields like
-        # ``gateway.mode`` that the gateway requires on startup.  Patch them
-        # back in immediately after ``agents add`` completes so the gateway
-        # restart below does not fail with "missing gateway.mode".
+        # ``gateway.mode``.  Patch them back so the gateway reads a fully
+        # correct config on its fresh start below.
         await environment.write_file(
             "/tmp/patch_gateway_mode.py",
             "import json, os\n"
@@ -160,42 +199,36 @@ class OpenClawAgent(ContainerAgent):
             timeout=10,
         )
 
-        # ``agents add`` writes to openclaw.json and exits; the gateway picks up
-        # the change via an inotify watcher.  In containers that hit the inotify
-        # limit (ENOSPC) the watcher silently fails and the gateway may not
-        # learn about the new agent for 30–60 s.  Force-restarting the gateway
-        # here ensures it loads the agent config from disk immediately, so that
-        # the first ``openclaw agent --message`` call in run() succeeds.
-        await environment.execute_command(
-            "pkill -9 -f 'openclaw gateway' 2>/dev/null; "
-            "pkill -9 -f 'openclaw-gateway' 2>/dev/null; "
-            "sleep 0.5; true",
-            timeout=8,
+        # Re-apply provider/model config after ``agents add`` may have
+        # overwritten provider or model-entry fields.
+        await self._configure_openclaw_json(
+            environment,
+            api_key=api_key,
+            base_url=base_url,
+            model_identifier=model_identifier,
+            explicit_base_url=bool(self.config.get("base_url")),
         )
+
+        # Start exactly one gateway after all config is final.
+        await self._start_gateway(
+            environment, api_key=api_key, provider_str=provider_str
+        )
+
+        # ``openclaw agents add`` writes BOOTSTRAP.md (the onboarding wizard
+        # trigger) plus SOUL.md, IDENTITY.md, HEARTBEAT.md, TOOLS.md, USER.md
+        # (the agent's shipped personality/capability files) into the workspace.
+        #
+        # We ONLY remove BOOTSTRAP.md to prevent the onboarding wizard from
+        # intercepting the first benchmark message.  SOUL.md, IDENTITY.md, and
+        # the other files are openclaw's own native capability hints; removing
+        # them artificially disadvantages openclaw relative to other agents and
+        # is not a fair evaluation baseline.  They also differ from the harness
+        # "prompt helps" that copaw/hermes receive — they are part of the agent
+        # itself, not injected by the benchmark harness.
         await environment.execute_command(
-            f"export QWEN_API_KEY={shlex.quote(api_key)} && "
-            f"export DASHSCOPE_API_KEY={shlex.quote(api_key)} && "
-            f"export OPENAI_API_KEY={shlex.quote(api_key)} && "
-            "export OPENCLAW_DISABLE_BONJOUR=1 && "
-            "nohup openclaw gateway >/tmp/openclaw_gateway.log 2>&1 & "
-            "echo $! >/tmp/openclaw_gateway.pid || true",
+            f"rm -f {shlex.quote(AGENT_WORKSPACE)}/BOOTSTRAP.md",
             timeout=10,
         )
-        # Wait for gateway to come back up and load the new agent config.
-        wait_cmd = (
-            f'python3 -c "'
-            "import socket, time; "
-            f"deadline=time.time()+45; ok=False\n"
-            "while time.time()<deadline:\n"
-            f"  s=socket.socket(); s.settimeout(0.3)\n"
-            f"  try: s.connect(('127.0.0.1',18789)); ok=True; break\n"
-            f"  except Exception: time.sleep(0.3)\n"
-            f"  finally:\n"
-            f"    try: s.close()\n"
-            f"    except Exception: pass\n"
-            "print('GATEWAY_READY' if ok else 'GATEWAY_NOT_READY')\""
-        )
-        await environment.execute_command(wait_cmd, timeout=55)
 
     # ── openclaw.json configuration ───────────────────────────────────────────
 
@@ -216,6 +249,66 @@ class OpenClawAgent(ContainerAgent):
         "google":    "GOOGLE_API_KEY",
     }
 
+    # Per-provider set of env vars to export when calling the openclaw CLI.
+    # DashScope needs all three legacy names; Anthropic/Google need their own
+    # native var plus OPENAI_API_KEY as a safety net for openclaw internals.
+    _PROVIDER_CLI_ENVS: Dict[str, List[str]] = {
+        "dashscope": ["DASHSCOPE_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY"],
+        "qwen":      ["DASHSCOPE_API_KEY", "QWEN_API_KEY", "OPENAI_API_KEY"],
+        "anthropic": ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"],
+        "google":    ["GOOGLE_API_KEY", "OPENAI_API_KEY"],
+        "gemini":    ["GOOGLE_API_KEY", "OPENAI_API_KEY"],
+    }
+
+    def _make_key_env(self, provider_str: str, api_key: str) -> str:
+        """Return 'export VAR=key && export VAR2=key && ' for all env vars this provider needs."""
+        env_vars = self._PROVIDER_CLI_ENVS.get(provider_str, ["OPENAI_API_KEY"])
+        return " && ".join(f"export {v}={shlex.quote(api_key)}" for v in env_vars) + " && "
+
+    async def _kill_gateway(self, environment: BaseEnvironment) -> None:
+        """Stop any gateway process so config writes do not trigger hot-reload races."""
+        await environment.execute_command(
+            "kill -9 $(cat /tmp/openclaw_gateway.pid 2>/dev/null) 2>/dev/null || true; "
+            "pkill -9 -f 'openclaw gateway' 2>/dev/null || true; "
+            "pkill -9 -f 'openclaw-gateway' 2>/dev/null || true; "
+            "sleep 0.5; true",
+            timeout=10,
+        )
+
+    async def _wait_gateway_ready(
+        self, environment: BaseEnvironment, *, port: int = _GATEWAY_PORT
+    ) -> None:
+        wait_cmd = (
+            f'python3 -c "'
+            "import socket, time; "
+            f"deadline=time.time()+45; ok=False\n"
+            "while time.time()<deadline:\n"
+            f"  s=socket.socket(); s.settimeout(0.3)\n"
+            f"  try: s.connect(('127.0.0.1',{port})); ok=True; break\n"
+            f"  except Exception: time.sleep(0.3)\n"
+            f"  finally:\n"
+            f"    try: s.close()\n"
+            f"    except Exception: pass\n"
+            "print('GATEWAY_READY' if ok else 'GATEWAY_NOT_READY')\""
+        )
+        await environment.execute_command(wait_cmd, timeout=55)
+
+    async def _start_gateway(
+        self,
+        environment: BaseEnvironment,
+        *,
+        api_key: str,
+        provider_str: str,
+    ) -> None:
+        await environment.execute_command(
+            self._make_key_env(provider_str, api_key)
+            + "export OPENCLAW_DISABLE_BONJOUR=1 && "
+            "nohup openclaw gateway >/tmp/openclaw_gateway.log 2>&1 & "
+            "echo $! >/tmp/openclaw_gateway.pid || true",
+            timeout=10,
+        )
+        await self._wait_gateway_ready(environment)
+
     async def _configure_openclaw_json(
         self,
         environment: BaseEnvironment,
@@ -223,6 +316,7 @@ class OpenClawAgent(ContainerAgent):
         api_key: str,
         base_url: str,
         model_identifier: str,
+        explicit_base_url: bool = False,
     ) -> None:
         """Patch ``~/.openclaw/openclaw.json`` with provider and model config.
 
@@ -251,29 +345,50 @@ class OpenClawAgent(ContainerAgent):
             model_name = model_identifier.split("/")[-1]
 
             # ── provider id & base URL ─────────────────────────────────────
+            #
+            # Routing priority:
+            #   1. dashscope/qwen  → always "dashscope" custom provider
+            #      (built-in "qwen" plugin forces openai-responses, incompatible
+            #      with DashScope's openai-completions-only endpoint).
+            #   2. openai / anthropic / google / gemini → always use openclaw's
+            #      native provider name so auth headers are correct (Anthropic
+            #      requires x-api-key not Authorization: Bearer; Google needs its
+            #      own signing).  base_url is forwarded when the caller set an
+            #      explicit endpoint override (e.g. self-hosted Anthropic proxy);
+            #      omitted otherwise so openclaw uses its built-in default URL.
+            #   3. Unknown provider string with explicit base_url → custom-<host>
+            #      OpenAI-compatible custom endpoint.
+            #   4. Fallback → provider_str as-is, no base_url.
             if provider_str in ("dashscope", "qwen"):
-                # openclaw's first-party Qwen/DashScope plugin (extensions/qwen/)
-                # defines PROVIDER_ID = "qwen" and only recognises "qwen" /
-                # "modelstudio" when scanning openclaw.json at runtime.  Writing
-                # "dashscope" as the provider key would be treated as an unknown
-                # custom provider and the qwen plugin would still route known Qwen
-                # model names to its own "qwen" entry, silently overriding ours.
-                # Using "qwen" as the key, combined with disabling the plugin
-                # below, gives us full control over the provider configuration.
+                # openclaw's first-party DashScope integration uses "qwen" as
+                # its canonical provider ID (see extensions/qwen/).  Using this
+                # name makes the agent model reference (qwen/<name> written by
+                # _openclaw_model_id) resolve correctly against the provider
+                # entry we write here, preventing the "unknown agent id" error.
                 openclaw_provider = "qwen"
-                effective_base_url = (
-                    base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1"
-                )
-            elif provider_str == "custom":
-                # For CUSTOM providers, use "custom" as the provider key so it
-                # matches the model reference written by ``openclaw agents add
-                # --model custom/<model_name>``.  Using a hostname-derived key
-                # (e.g. "custom-172-17-0-1") would create a mismatch: the agent
-                # entry would reference provider "custom" while the provider is
-                # registered under the hostname-derived name, causing the gateway
-                # to fail model lookup silently.
-                openclaw_provider = "custom"
-                effective_base_url = base_url or ""
+                if base_url:
+                    effective_base_url = base_url
+                else:
+                    # CN endpoint is more reliable inside mainland; fall back to
+                    # international endpoint when DASHSCOPE_INTL is set.
+                    import os as _os
+                    if _os.environ.get("DASHSCOPE_INTL"):
+                        effective_base_url = (
+                            "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+                        )
+                    else:
+                        effective_base_url = (
+                            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+                        )
+            elif provider_str in ("openai", "anthropic", "google", "gemini"):
+                # Always use openclaw's native provider name so auth headers are
+                # handled correctly (Anthropic needs x-api-key not Bearer; Google
+                # needs its own signing logic).  base_url is set only when the
+                # caller explicitly configured a non-default endpoint (e.g. a
+                # self-hosted Anthropic-compatible proxy); omitting it for the
+                # default case lets openclaw fall back to its own hardcoded URL.
+                openclaw_provider = provider_str
+                effective_base_url = base_url if explicit_base_url else ""
             elif base_url:
                 from urllib.parse import urlparse
                 hostname = urlparse(base_url).hostname or "custom"
@@ -303,17 +418,22 @@ class OpenClawAgent(ContainerAgent):
                 "name": model_name,
                 "compat": {"supportsTools": True},
             }
-            # Resolve vision capability from ModelConfig — single source of truth.
-            # supports_vision / vision_model are populated by ModelConfigManager
-            # from the _VISION_CAPABLE_MODELS / _VISION_COMPANION registries in
-            # model_config.py; no capability knowledge lives in this file.
-            mc = get_model_config(model_identifier)
-            _input_modalities = ["text", "image"] if mc.supports_vision else ["text"]
+            # Pawbench: always route image-tool calls to the model under evaluation.
+            # Avoids openclaw built-in fallbacks (gpt-5.4-mini, qwen3.5-plus, …).
+            # Override only via agent_config["vision_model"] for a separate VL id.
+            vision_model_name: str = self.config.get("vision_model") or model_name
+            vision_model_ref = f"{openclaw_provider}/{vision_model_name}"
+            _input_modalities = ["text", "image"]
 
             # Populate context/token limits, reasoning flag, and input modalities
             # for well-known providers.  openclaw uses these to drive thinking
             # mode activation, context-window guards, and tool routing.
             if provider_str in ("dashscope", "qwen"):
+                # Set reasoning=True so openclaw activates extended thinking for
+                # Qwen3 models.  We no longer forcibly pin api="openai-completions"
+                # here; the native "qwen" provider extension handles DashScope
+                # routing correctly and openclaw will pick the right API type for
+                # the endpoint we supply in prov['baseUrl'].
                 model_entry["reasoning"] = True
                 model_entry["contextWindow"] = 200000
                 model_entry["maxTokens"] = 32768
@@ -327,27 +447,15 @@ class OpenClawAgent(ContainerAgent):
                 model_entry["contextWindow"] = 128000
                 model_entry["maxTokens"] = 16384
                 model_entry["input"] = _input_modalities
+            else:
+                model_entry["input"] = _input_modalities
 
             primary = f"{openclaw_provider}/{model_name}"
 
-            # ── vision model (agents.defaults.imageModel) ─────────────────
-            # openclaw routes image-tool calls through agents.defaults.imageModel.
-            # Without an explicit setting it falls back to the global default
-            # (currently openai/gpt-5.5), which 403s when a DashScope key is
-            # active.  Callers can override via agent_config["vision_model"].
-            vision_model_name: str = (
-                self.config.get("vision_model")
-                or (model_name if mc.supports_vision else "")
-                or mc.vision_model
-                or ""
-            )
-            vision_model_ref = (
-                f"{openclaw_provider}/{vision_model_name}" if vision_model_name else ""
-            )
-            # Only register a separate VL provider entry when the primary model
-            # is text-only; vision-capable models already cover image input.
+            # agents.defaults.imageModel → vision_model_ref (see vision_model_name above)
+            # Separate VL entry only when imageModel points at a different model id.
             vision_model_entry: Dict[str, Any] = {}
-            if vision_model_name and not mc.supports_vision:
+            if vision_model_name and vision_model_name != model_name:
                 vision_model_entry = {
                     "id": vision_model_name,
                     "name": vision_model_name,
@@ -366,7 +474,7 @@ class OpenClawAgent(ContainerAgent):
                 f"  {{'api': {json.dumps(provider_api)}, 'models': []}})\n"
                 f"prov['api'] = {json.dumps(provider_api)}\n"
                 f"prov['baseUrl'] = {json.dumps(effective_base_url)}\n"
-                f"prov['apiKey'] = {json.dumps(api_key_entry)}\n"
+                + f"prov['apiKey'] = {json.dumps(api_key_entry)}\n"
                 # ── primary model entry ────────────────────────────────────
                 "models = prov.setdefault('models', [])\n"
                 f"m = next((x for x in models if x.get('id') == {json.dumps(model_name)} or x.get('name') == {json.dumps(model_name)}), None)\n"
@@ -420,23 +528,53 @@ class OpenClawAgent(ContainerAgent):
                 + (
                     f"agents_cfg['imageModel'] = {json.dumps(vision_model_ref)}\n"
                     f"print('vision model set to: {vision_model_ref}')\n"
-                    if vision_model_ref else
-                    "print('no vision model configured for this provider')\n"
                 )
-                # ── disable qwen plugin (dashscope only) ──────────────────
-                # The built-in "qwen" plugin (extensions/qwen/) routes known
-                # Qwen model names (e.g. qwen3.6-plus) to the "qwen" provider
-                # with "openai-responses" API at runtime, based on model name
-                # matching — regardless of which provider key we wrote.  This
-                # would override our "qwen/openai-completions" config, which is
-                # the correct protocol for DashScope's OpenAI-compat endpoint.
-                # Disabling the plugin ensures our provider config is used as-is.
-                # models.mode=merge alone does not suppress the plugin's runtime
-                # API-type override.
+                # ── disable built-in qwen plugin (dashscope/qwen only) ────
+                # The built-in "qwen" plugin (extensions/qwen/) registers its
+                # OWN provider entry at gateway startup using credentials from
+                # the auth-profile baked into the image by
+                # ``openclaw onboard --auth-choice qwen-standard-api-key-cn``
+                # in Dockerfile.pawbench-openclaw (placeholder
+                # sk-build-placeholder).  When a request is routed for any
+                # known Qwen model name, the plugin's runtime resolver
+                # OVERRIDES the apiKey / baseUrl we wrote into openclaw.json,
+                # silently sending the placeholder key to DashScope → 401
+                # "Incorrect API key".
+                #
+                # Disabling the plugin keeps our provider entry as the sole
+                # source of truth.  This is the difference between Claude-only
+                # models working (route through "anthropic"/"openai" providers
+                # untouched by the qwen plugin) and all 7 non-Claude models
+                # 100% failing with HTTP 401 in pawbench-7models-opusjudge-20260525.
+                #
+                # Applied to BOTH "dashscope" (raw provider str from the model
+                # identifier) AND "qwen" (post-translation), so callers using
+                # either spelling are protected.
+                #
+                # Also disable the built-in "openai" plugin and drop stale
+                # providers['openai'] entries.  openclaw 2026.5.x auto-enables
+                # ``openai/<model>`` at gateway startup (see gateway log:
+                # "auto-enabled plugins for openai/qwen3.6-plus"), which
+                # overrides our qwen/ provider and routes DashScope calls with
+                # wrong auth / quota paths.
                 + (
-                    "d.setdefault('plugins', {}).setdefault('entries', {})['qwen'] = {'enabled': False}\n"
-                    if provider_str == "dashscope" else ""
+                    "pe = d.setdefault('plugins', {}).setdefault('entries', {})\n"
+                    "pe['qwen'] = {'enabled': False}\n"
+                    "pe['openai'] = {'enabled': False}\n"
+                    "for stale in ('openai', 'dashscope'):\n"
+                    "    providers.pop(stale, None)\n"
+                    if provider_str in ("dashscope", "qwen") else ""
                 )
+                # ── commands: enable native skills ────────────────────────
+                # QwenClawBench sets commands.native="auto" and
+                # commands.nativeSkills="auto" so openclaw can discover and
+                # invoke skills defined in the workspace (e.g. SKILL.md files).
+                # Without this, skill-related tasks are evaluated at a
+                # disadvantage compared to the reference benchmark.
+                + "cmd = d.setdefault('commands', {})\n"
+                + "cmd.setdefault('native', 'auto')\n"
+                + "cmd['nativeSkills'] = 'auto'\n"
+                + "cmd.setdefault('restart', False)\n"
                 # ── tools ─────────────────────────────────────────────────
                 # Allow all tools by default; restrictive defaults may silently
                 # block shell/browser tools the agent needs for tasks.
@@ -448,9 +586,8 @@ class OpenClawAgent(ContainerAgent):
             )
             await environment.write_file("/tmp/patch_openclaw.py", patch_script)
             patch_result = await environment.execute_command(
-                f"export QWEN_API_KEY={shlex.quote(api_key)} "
-                f"DASHSCOPE_API_KEY={shlex.quote(api_key)} && "
-                "python3 /tmp/patch_openclaw.py",
+                self._make_key_env(provider_str, api_key)
+                + "python3 /tmp/patch_openclaw.py",
                 timeout=15,
             )
             if patch_result.get("returncode", 1) != 0:
@@ -497,7 +634,7 @@ class OpenClawAgent(ContainerAgent):
             timeout=180,
         )
 
-    async def _ensure_gateway(self, environment: BaseEnvironment, *, api_key: str = "") -> None:
+    async def _ensure_gateway(self, environment: BaseEnvironment, *, api_key: str = "", provider_str: str = "openai") -> None:
         port = _GATEWAY_PORT
 
         # TCP-based liveness check: verify the gateway port is actually accepting
@@ -522,47 +659,10 @@ class OpenClawAgent(ContainerAgent):
         if "ALIVE" in (r.get("stdout") or ""):
             return
 
-        # Gateway not running (or PID dead after a crash).  Kill any stale
-        # zombie/orphan processes before starting a fresh one.
-        await environment.execute_command(
-            "pkill -9 -f 'openclaw gateway' 2>/dev/null; "
-            "pkill -9 -f 'openclaw-gateway' 2>/dev/null; "
-            "sleep 0.5; true",
-            timeout=8,
+        await self._kill_gateway(environment)
+        await self._start_gateway(
+            environment, api_key=api_key, provider_str=provider_str
         )
-
-        # OPENCLAW_DISABLE_BONJOUR=1 prevents the bonjour/ciao mDNS advertiser
-        # from running.  In a Docker container the default bridge network does
-        # not support multicast; when bonjour tries to announce and fails,
-        # `installCiaoUnhandledRejectionListener` may re-throw the rejection as
-        # an uncaught exception, crashing the gateway process and leaving every
-        # subsequent WebSocket connection with a 1006 abnormal closure.
-        await environment.execute_command(
-            f"export QWEN_API_KEY={shlex.quote(api_key)} && "
-            f"export DASHSCOPE_API_KEY={shlex.quote(api_key)} && "
-            f"export OPENAI_API_KEY={shlex.quote(api_key)} && "
-            "export OPENCLAW_DISABLE_BONJOUR=1 && "
-            "nohup openclaw gateway >/tmp/openclaw_gateway.log 2>&1 & "
-            "echo $! >/tmp/openclaw_gateway.pid || true",
-            timeout=10,
-        )
-
-        # Allow up to 45 s for the gateway to install plugin deps and start
-        # listening.  On a warm container (deps already cached) this is < 2 s.
-        wait_cmd = (
-            f'python3 -c "'
-            "import socket, time; "
-            f"deadline=time.time()+45; ok=False\n"
-            "while time.time()<deadline:\n"
-            f"  s=socket.socket(); s.settimeout(0.3)\n"
-            f"  try: s.connect(('127.0.0.1',{port})); ok=True; break\n"
-            f"  except Exception: time.sleep(0.3)\n"
-            f"  finally:\n"
-            f"    try: s.close()\n"
-            f"    except Exception: pass\n"
-            "print('GATEWAY_READY' if ok else 'GATEWAY_NOT_READY')\""
-        )
-        await environment.execute_command(wait_cmd, timeout=55)
 
     async def _ensure_gateway_strict(self, environment: BaseEnvironment, *, api_key: str = "") -> None:
         """Stronger gateway start used for the browser-plugin investigation.
@@ -587,11 +687,13 @@ class OpenClawAgent(ContainerAgent):
             timeout=10,
         )
 
+        provider_str_strict = (
+            (self.config.get("model", "dashscope/qwen3.6-plus") or "").split("/", 1)[0].lower()
+            or "openai"
+        )
         await environment.execute_command(
-            f"export QWEN_API_KEY={shlex.quote(api_key)} && "
-            f"export DASHSCOPE_API_KEY={shlex.quote(api_key)} && "
-            f"export OPENAI_API_KEY={shlex.quote(api_key)} && "
-            "export OPENCLAW_DISABLE_BONJOUR=1 && "
+            self._make_key_env(provider_str_strict, api_key)
+            + "export OPENCLAW_DISABLE_BONJOUR=1 && "
             "rm -f /tmp/openclaw_gateway.log && "
             "nohup openclaw gateway >/tmp/openclaw_gateway.log 2>&1 & "
             "echo $! >/tmp/openclaw_gateway.pid || true",
@@ -611,13 +713,69 @@ class OpenClawAgent(ContainerAgent):
         )
         await environment.execute_command(wait_cmd, timeout=75)
 
+    async def _wait_for_session_flush(
+        self,
+        environment: BaseEnvironment,
+        *,
+        agent_id_lower: str,
+    ) -> None:
+        """Best-effort wait for OpenClaw to finish writing session artifacts.
+
+        OpenClaw may return from CLI before trajectory/session files are fully
+        flushed. Poll briefly for a recent ``model.completed`` event with a
+        non-empty ``messagesSnapshot`` to reduce short-transcript races.
+        """
+        wait_script = (
+            "import glob, json, os, time\n"
+            f"sessions_dir = '/root/.openclaw/agents/{agent_id_lower}/sessions'\n"
+            "deadline = time.time() + 12\n"
+            "def has_completed_snapshot(path):\n"
+            "    try:\n"
+            "        lines = open(path, 'r', encoding='utf-8').read().splitlines()\n"
+            "    except Exception:\n"
+            "        return False\n"
+            "    for line in reversed(lines):\n"
+            "        line = line.strip()\n"
+            "        if not line:\n"
+            "            continue\n"
+            "        try:\n"
+            "            obj = json.loads(line)\n"
+            "        except Exception:\n"
+            "            continue\n"
+            "        if not isinstance(obj, dict) or obj.get('type') != 'model.completed':\n"
+            "            continue\n"
+            "        snap = (obj.get('data') or {}).get('messagesSnapshot')\n"
+            "        return isinstance(snap, list) and len(snap) > 0\n"
+            "    return False\n"
+            "while time.time() < deadline:\n"
+            "    traj = sorted(glob.glob(os.path.join(sessions_dir, '*.trajectory.jsonl')), key=os.path.getmtime, reverse=True)\n"
+            "    if traj and has_completed_snapshot(traj[0]):\n"
+            "        print('SESSION_READY')\n"
+            "        raise SystemExit(0)\n"
+            "    plain = sorted(glob.glob(os.path.join(sessions_dir, '*.jsonl')), key=os.path.getmtime, reverse=True)\n"
+            "    plain = [p for p in plain if not p.endswith('.trajectory.jsonl')]\n"
+            "    if plain and os.path.getsize(plain[0]) > 0:\n"
+            "        print('SESSION_READY_PLAIN')\n"
+            "        raise SystemExit(0)\n"
+            "    time.sleep(1)\n"
+            "print('SESSION_NOT_READY')\n"
+        )
+        await environment.write_file("/tmp/wait_openclaw_session.py", wait_script)
+        await environment.execute_command(
+            "python3 /tmp/wait_openclaw_session.py",
+            timeout=15,
+        )
+
     # ── run ───────────────────────────────────────────────────────────────────
 
     async def run(self, instruction: str, environment: BaseEnvironment) -> Dict[str, Any]:
         model_identifier = self.config.get("model", "dashscope/qwen3.6-plus")
-        rc = get_model_config(model_identifier).resolve_with(self.config)
-        api_key = rc.api_key
-        model_config = rc.model_config
+        model_config = get_model_config(model_identifier)
+        api_key = self._resolve_api_key(model_config)
+        provider_str = (
+            model_identifier.split("/", 1)[0].lower()
+            if "/" in model_identifier else "openai"
+        )
 
         agent_id = self._agent_id()
         agent_id_lower = agent_id.lower()
@@ -633,16 +791,13 @@ class OpenClawAgent(ContainerAgent):
         )
 
         # Re-check gateway liveness before each task (it may have crashed).
-        await self._ensure_gateway(environment, api_key=api_key)
+        await self._ensure_gateway(environment, api_key=api_key, provider_str=provider_str)
 
         # Verify the agent is actually known to the gateway.  In rare cases
         # (inotify exhaustion, timing) the gateway starts without the agent
         # config loaded.  Re-add + restart the gateway when that happens.
         openclaw_model = self._openclaw_model_id(model_identifier)
-        env_prefix = (
-            f"export QWEN_API_KEY={shlex.quote(api_key)} "
-            f"DASHSCOPE_API_KEY={shlex.quote(api_key)} && "
-        )
+        env_prefix = self._make_key_env(provider_str, api_key)
         check_result = await environment.execute_command(
             f"{env_prefix}openclaw agents list 2>&1 || true",
             timeout=30,
@@ -654,6 +809,7 @@ class OpenClawAgent(ContainerAgent):
                 "Agent %s not found in 'openclaw agents list' at run() start — re-adding and restarting gateway",
                 agent_id,
             )
+            await self._kill_gateway(environment)
             await environment.execute_command(
                 f"{env_prefix}"
                 f"openclaw agents add {shlex.quote(agent_id)} "
@@ -662,7 +818,6 @@ class OpenClawAgent(ContainerAgent):
                 "--non-interactive",
                 timeout=120,
             )
-            # Restore gateway.mode which agents add may have dropped.
             await environment.write_file(
                 "/tmp/patch_gateway_mode.py",
                 "import json, os\n"
@@ -676,45 +831,16 @@ class OpenClawAgent(ContainerAgent):
                 "python3 /tmp/patch_gateway_mode.py",
                 timeout=10,
             )
-            # Force-restart gateway to load the newly written config.
-            await environment.execute_command(
-                "pkill -9 -f 'openclaw gateway' 2>/dev/null; "
-                "pkill -9 -f 'openclaw-gateway' 2>/dev/null; "
-                "sleep 0.5; true",
-                timeout=8,
+            base_url = self.config.get("base_url") or model_config.base_url or ""
+            await self._configure_openclaw_json(
+                environment,
+                api_key=api_key,
+                base_url=base_url,
+                model_identifier=model_identifier,
+                explicit_base_url=bool(self.config.get("base_url")),
             )
-            await environment.execute_command(
-                f"export QWEN_API_KEY={shlex.quote(api_key)} && "
-                f"export DASHSCOPE_API_KEY={shlex.quote(api_key)} && "
-                f"export OPENAI_API_KEY={shlex.quote(api_key)} && "
-                "export OPENCLAW_DISABLE_BONJOUR=1 && "
-                "nohup openclaw gateway >/tmp/openclaw_gateway.log 2>&1 & "
-                "echo $! >/tmp/openclaw_gateway.pid || true",
-                timeout=10,
-            )
-            wait_cmd = (
-                f'python3 -c "'
-                "import socket, time; "
-                f"deadline=time.time()+45; ok=False\n"
-                "while time.time()<deadline:\n"
-                f"  s=socket.socket(); s.settimeout(0.3)\n"
-                f"  try: s.connect(('127.0.0.1',18789)); ok=True; break\n"
-                f"  except Exception: time.sleep(0.3)\n"
-                f"  finally:\n"
-                f"    try: s.close()\n"
-                f"    except Exception: pass\n"
-                "print('GATEWAY_READY' if ok else 'GATEWAY_NOT_READY')\""
-            )
-            await environment.execute_command(wait_cmd, timeout=55)
-
-        # Remove BOOTSTRAP.md / SOUL.md from the task workspace so they don't
-        # distract the agent with openclaw-specific onboarding instructions.
-        # Enabled by default (skip_bootstrap defaults to True); pass
-        # skip_bootstrap=False in agent_config to keep the files.
-        if self.config.get("skip_bootstrap", True):
-            await environment.execute_command(
-                f"rm -f {AGENT_WORKSPACE}/BOOTSTRAP.md 2>/dev/null || true",
-                timeout=10,
+            await self._start_gateway(
+                environment, api_key=api_key, provider_str=provider_str
             )
 
         escaped = shlex.quote(instruction)
@@ -730,18 +856,40 @@ class OpenClawAgent(ContainerAgent):
         )
 
         run_cmd = (
-            f"export QWEN_API_KEY={shlex.quote(api_key)} && "
-            f"export OPENAI_API_KEY={shlex.quote(api_key)} && "
-            f"export DASHSCOPE_API_KEY={shlex.quote(api_key)} && "
-            f"cd {shlex.quote(AGENT_WORKSPACE)} && "
+            self._make_key_env(provider_str, api_key)
+            + f"cd {shlex.quote(AGENT_WORKSPACE)} && "
             f"timeout {inner_timeout}s openclaw agent "
             f"--agent {shlex.quote(agent_id)} --session-id {session_id} "
             f"{thinking_args}--message {escaped} "
             f"2>&1 | tee /tmp/openclaw_output.txt || true"
         )
+        # Snapshot existing text files before the run starts so that
+        # extract_transcript() can exclude pre-staged fixture files.
+        # post_run_collect() copies openclaw's internal workspace with cp
+        # (no -p), giving all synced files mtime = now, which would cause
+        # mtime-based filtering to treat fixtures as agent output.  Storing
+        # the pre-run set of basenames gives us a reliable exclusion list.
+        _prerun_ls = await environment.execute_command(
+            f"find {shlex.quote(AGENT_WORKSPACE)} -type f "
+            r"\( -name '*.md' -o -name '*.txt' -o -name '*.csv' \) "
+            r"-printf '%f\n' 2>/dev/null || true"
+        )
+        self._pre_run_file_basenames: set[str] = set(
+            _prerun_ls.get("stdout", "").splitlines()
+        )
+        # Record run start time so extract_transcript() can identify
+        # files created during this task (vs pre-mounted fixture files).
+        self._run_start_time: float = time.time()
         result = await environment.execute_command(run_cmd, timeout=inner_timeout + 60)
         output_content = (
             await environment.read_file("/tmp/openclaw_output.txt") or result["stdout"]
+        )
+
+        # Reduce race where session files are copied before OpenClaw flushes the
+        # final model.completed event.
+        await self._wait_for_session_flush(
+            environment,
+            agent_id_lower=agent_id_lower,
         )
 
         # Copy openclaw session files into workspace/sessions/ so that
@@ -779,6 +927,150 @@ class OpenClawAgent(ContainerAgent):
                 "session_id": session_id,
             },
         }
+
+    def extract_transcript(
+        self,
+        local_workspace: "Any",
+        stdout: str,
+    ) -> "List[Dict[str, Any]]":
+        """Extend the base transcript with workspace output files.
+
+        openclaw writes structured results (tables, analysis, reports) to files
+        in the workspace but only provides a brief prose summary in its final
+        assistant message.  The automated grader searches the transcript for
+        specific patterns (Markdown tables, numbers, keywords), so the grader
+        misses valid output that lives only in files.
+
+        This override appends a synthetic final assistant message containing the
+        content of every text/Markdown file that was created *during* the run
+        (identified by mtime >= self._run_start_time).  copaw and hermes are
+        unaffected because they do not use this class.
+        """
+        transcript = super().extract_transcript(local_workspace, stdout)
+
+        run_start: float | None = getattr(self, "_run_start_time", None)
+        if run_start is None or local_workspace is None:
+            return transcript
+
+        from pathlib import Path as _Path
+
+        ws = _Path(local_workspace)
+        if not ws.is_dir():
+            return transcript
+
+        # sessions/ contains agent metadata; output/ is a mirror copy created by
+        # _sync_workspace_to_output — skip both to avoid double-counting.
+        # fixtures/ holds read-only task inputs whose mtime equals the workspace
+        # copy time (always >= _run_start_time), so they would be misidentified
+        # as agent-produced output — exclude them explicitly.
+        _SKIP_TOP = {"sessions", "output", "fixtures"}
+        _TEXT_SUFFIXES = {".md", ".txt", ".csv"}
+        # openclaw writes these identity/config files on every startup — they
+        # are never task output, so exclude them regardless of mtime.
+        _SKIP_NAMES = {
+            "SOUL.md", "TOOLS.md", "IDENTITY.md", "AGENTS.md",
+            "USER.md", "HEARTBEAT.md", "BOOTSTRAP.md", "HEAD",
+        }
+
+        # Basenames of files that already existed before the openclaw command
+        # ran (snapshot taken in run()).  post_run_collect() copies openclaw's
+        # internal workspace without preserving mtime, so every synced file
+        # appears "new" to the mtime filter — this set lets us exclude them.
+        pre_run_names: set[str] = getattr(self, "_pre_run_file_basenames", set())
+
+        new_files: list[tuple[float, _Path]] = []
+        for f in ws.rglob("*"):
+            if not f.is_file():
+                continue
+            try:
+                rel_parts = f.relative_to(ws).parts
+            except ValueError:
+                continue
+            if rel_parts and rel_parts[0] in _SKIP_TOP:
+                continue
+            if f.name in _SKIP_NAMES:
+                continue
+            if f.suffix.lower() not in _TEXT_SUFFIXES:
+                continue
+            # Skip files that existed before the run (pre-staged fixtures).
+            if f.name in pre_run_names:
+                continue
+            try:
+                mtime = f.stat().st_mtime
+            except OSError:
+                continue
+            # Only files written after the task run started.
+            if mtime >= run_start:
+                new_files.append((mtime, f))
+
+        if not new_files:
+            return transcript
+
+        new_files.sort()  # ascending by mtime — chronological order
+
+        parts: list[str] = []
+        total_chars = 0
+        for _, f in new_files[:10]:
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace").strip()
+            except OSError:
+                continue
+            if len(content) < 30:
+                continue
+            rel = str(f.relative_to(ws))
+            chunk = f"[File: {rel}]\n{content}"
+            remaining = 80_000 - total_chars
+            if len(chunk) > remaining:
+                if remaining < 200:
+                    break
+                chunk = chunk[:remaining] + "\n[...truncated...]"
+            parts.append(chunk)
+            total_chars += len(chunk)
+            if total_chars >= 80_000:
+                break
+
+        if not parts:
+            return transcript
+
+        synth_text = "\n\n---\n\n".join(parts)
+        transcript.append({
+            "type": "message",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": synth_text}],
+            },
+        })
+        return transcript
+
+    async def post_run_collect(self, environment: BaseEnvironment) -> None:
+        """Sync openclaw internal workspace to the standard benchmark path.
+
+        openclaw's ACPX runtime may write files to the global-default workspace
+        (/root/.openclaw/workspace) rather than the per-agent workspace even when
+        ``agents add --workspace`` is used.  Mirror all non-bytecode files from
+        every known openclaw workspace location into AGENT_WORKSPACE before the
+        backend snapshots it for grading.
+        """
+        _SYNC_CMD = rf"""
+DEST={AGENT_WORKSPACE}
+mkdir -p "$DEST/output"
+for src_dir in /root/.openclaw/workspace ~/.openclaw/workspace; do
+  [ -d "$src_dir" ] || continue
+  # skip if already pointing at AGENT_WORKSPACE (symlink or same inode)
+  real_src=$(realpath "$src_dir" 2>/dev/null || echo "$src_dir")
+  real_dst=$(realpath "$DEST" 2>/dev/null || echo "$DEST")
+  [ "$real_src" = "$real_dst" ] && continue
+  find "$src_dir" -maxdepth 5 -type f \
+      ! -path '*/site-packages/*' ! -name '*.pyc' \
+      2>/dev/null | while read -r f; do
+    rel="${{f#${{src_dir}}/}}"
+    dest="$DEST/$rel"
+    mkdir -p "$(dirname "$dest")"
+    [ ! -s "$dest" ] && [ -s "$f" ] && cp "$f" "$dest" 2>/dev/null || true
+  done
+done
+"""
+        await environment.execute_command(_SYNC_CMD, timeout=30)
 
     async def teardown(self, environment: BaseEnvironment) -> None:
         agent_id = self._agent_id()

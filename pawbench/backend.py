@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -85,7 +86,8 @@ class TaskResult:
     # Anomaly detection result (from anomalies.detect_anomalies).
     # has_error=True means the score is unreliable (API quota, OOM, etc.).
     anomaly: dict = field(default_factory=dict)
-    # Task labels copied from the task's YAML front-matter ``labels:`` block.
+    # Task taxonomy labels extracted from the task's YAML front-matter.
+    # Keys: scenario, capabilities, complexity, modality, environment.
     labels: dict = field(default_factory=dict)
 
 
@@ -199,6 +201,7 @@ class PawBenchBackend(BenchmarkBackend):
         }
         agent = AgentFactory.create(agent_config)
         hard_limit = scaled_task_timeout + 600
+        t0_outer = time.time()
         try:
             return asyncio.run(
                 asyncio.wait_for(
@@ -207,16 +210,16 @@ class PawBenchBackend(BenchmarkBackend):
                 )
             )
         except (asyncio.TimeoutError, TimeoutError):
+            elapsed = time.time() - t0_outer
             return TaskResult(
                 task_id=task.task_id,
                 task_name=getattr(task, "name", task.task_id),
                 score=0.0, max_score=1.0, passed=False,
                 grading_type="error", breakdown={}, notes="",
-                execution_time=float(hard_limit),
+                execution_time=elapsed,
                 status="error", usage={}, transcript_length=0,
                 timed_out=True,
                 error=f"Task exceeded hard wall-clock limit of {hard_limit}s",
-                labels=getattr(task, "labels", {}),
             )
 
 
@@ -235,11 +238,9 @@ class PawBenchBackend(BenchmarkBackend):
         is delegated to the agent class via ``setup()``, ``post_run_collect()``
         and ``extract_transcript()``.
         """
-        from pawbench.envs.docker import DockerEnvironment
-
         api_key = agent_config.get("api_key") or os.environ.get("OPENAI_API_KEY", "")
         base_url = agent_config.get("base_url") or os.environ.get(
-            "OPENAI_BASE_URL", "https://api.openai.com/v1"
+            "OPENAI_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"
         )
         dataset = agent_config.get("dataset", self.DEFAULT_DATASET)
         judge_model = agent_config.get("judge_model")
@@ -252,15 +253,26 @@ class PawBenchBackend(BenchmarkBackend):
         assets_dir = self.benchmark_path / "data" / dataset / "assets"
         container_name = f"pawbench-{agent.name}-{task.task_id}-{uuid.uuid4().hex[:8]}"
 
-        env = DockerEnvironment(
-            name=container_name,
-            image=docker_image,
-            environment_vars={
-                "OPENAI_API_KEY": api_key,
-                "OPENAI_BASE_URL": base_url,
-                "DASHSCOPE_API_KEY": api_key,
-            },
-        )
+        # When PAWBENCH_ENV=local the benchmark is already running inside the
+        # target container (e.g. AP cluster), so we must NOT spin up a nested
+        # Docker container — use LocalEnvironment to run agent commands directly.
+        _use_local = os.environ.get("PAWBENCH_ENV") == "local"
+        print(f"[backend] _use_local={_use_local} PAWBENCH_ENV={os.environ.get('PAWBENCH_ENV')!r} COPAW_IN_CONTAINER={os.environ.get('COPAW_RUNNING_IN_CONTAINER')!r}", flush=True)
+        if _use_local:
+            from pawbench.envs.local import LocalEnvironment
+            env = LocalEnvironment(name=container_name)
+            print(f"[backend] Using LocalEnvironment", flush=True)
+        else:
+            from pawbench.envs.docker import DockerEnvironment
+            env = DockerEnvironment(
+                name=container_name,
+                image=docker_image,
+                environment_vars={
+                    "OPENAI_API_KEY": api_key,
+                    "OPENAI_BASE_URL": base_url,
+                    "DASHSCOPE_API_KEY": api_key,
+                },
+            )
 
         t0 = time.time()
         local_workspace: Path | None = None
@@ -269,6 +281,13 @@ class PawBenchBackend(BenchmarkBackend):
 
         try:
             await env.start()
+            # Keep per-task workspaces deterministic: remove any pre-existing
+            # files from the base image (for example BOOTSTRAP.md). Residual
+            # files can hijack prompt handling and cause short/off-topic runs.
+            await env.execute_command(
+                "mkdir -p /app/working/workspaces/default && "
+                "find /app/working/workspaces/default -mindepth 1 -maxdepth 1 -exec rm -rf {} +"
+            )
             await env.execute_command(
                 "mkdir -p /app/working/workspaces/default/output "
                 "/app/working/workspaces/default/sessions"
@@ -281,22 +300,17 @@ class PawBenchBackend(BenchmarkBackend):
                     await env.write_file(dest, file_spec["content"])
                 elif "source" in file_spec and "dest" in file_spec:
                     source_rel = file_spec["source"]
+                    # Some task sets (e.g. pawbench) write "source: assets/T-prefix/file"
+                    # while older sets write "source: file" (relative to task assets dir).
+                    # Normalise by stripping a leading "assets/" if present so the
+                    # candidate lookup below always operates on the bare relative path.
+                    source_rel_stripped = re.sub(r"^assets/", "", source_rel)
                     src: Path | None = None
-                    # Datasets such as pawbench-v1.0 use sources like
-                    # "assets/T042_.../fixtures/...".  *assets_dir* already ends
-                    # in ".../assets", so joining the full *source_rel* yields a
-                    # non-existent ".../assets/assets/..." path.  Strip a leading
-                    # "assets/" when present.
-                    source_rel_stripped = (
-                        source_rel[len("assets/") :]
-                        if source_rel.startswith("assets/")
-                        else source_rel
-                    )
                     for candidate in [
+                        assets_dir / task.task_id / source_rel_stripped,
+                        assets_dir / source_rel_stripped,
                         assets_dir / task.task_id / source_rel,
                         assets_dir / source_rel,
-                        assets_dir / source_rel_stripped,
-                        assets_dir / task.task_id / source_rel_stripped,
                     ]:
                         if candidate.exists():
                             src = candidate
@@ -319,21 +333,28 @@ class PawBenchBackend(BenchmarkBackend):
             await agent.post_run_collect(env)
 
             local_workspace = Path(tempfile.mkdtemp(prefix=f"pawbench_{task.task_id}_"))
-            # Primary copy: full workspace tree (includes sessions/, output/, etc.)
-            subprocess.run(
-                ["docker", "cp",
-                 f"{container_name}:/app/working/workspaces/default/.",
-                 str(local_workspace)],
-                capture_output=True, text=True,
-            )
-            # Secondary copy: flatten output/ files to workspace root so graders
-            # that look at the workspace root can find them directly.
-            subprocess.run(
-                ["docker", "cp",
-                 f"{container_name}:/app/working/workspaces/default/output/.",
-                 str(local_workspace)],
-                capture_output=True, text=True,
-            )
+            print(f"[backend] Collecting workspace: _use_local={_use_local} env_type={type(env).__name__}", flush=True)
+            if _use_local:
+                # Running inside the AP cluster pod (PAWBENCH_ENV=local): the
+                # workspace is already on the local filesystem — copy it directly
+                # without Docker.
+                env.collect_workspace(local_workspace)  # type: ignore[attr-defined]
+            else:
+                # Primary copy: full workspace tree (includes sessions/, output/, etc.)
+                subprocess.run(
+                    ["docker", "cp",
+                     f"{container_name}:/app/working/workspaces/default/.",
+                     str(local_workspace)],
+                    capture_output=True, text=True,
+                )
+                # Secondary copy: flatten output/ files to workspace root so graders
+                # that look at the workspace root can find them directly.
+                subprocess.run(
+                    ["docker", "cp",
+                     f"{container_name}:/app/working/workspaces/default/output/.",
+                     str(local_workspace)],
+                    capture_output=True, text=True,
+                )
 
             # Merge workspace/ subdir if docker cp created one inside local_workspace.
             workspace_subdir = local_workspace / "workspace"
@@ -348,6 +369,9 @@ class PawBenchBackend(BenchmarkBackend):
                         shutil.copy2(src_file, dest_file)
 
         except Exception as exc:
+            import traceback as _tb
+            full_tb = _tb.format_exc()
+            print(f"[backend] EXCEPTION in _run_agent_async:\n{full_tb}", flush=True)
             return TaskResult(
                 task_id=task.task_id,
                 task_name=getattr(task, "name", task.task_id),
@@ -355,8 +379,7 @@ class PawBenchBackend(BenchmarkBackend):
                 grading_type="error", breakdown={}, notes="",
                 execution_time=time.time() - t0,
                 status="error", usage={}, transcript_length=0,
-                timed_out=False, error=str(exc),
-                labels=getattr(task, "labels", {}),
+                timed_out=False, error=f"{exc}\nTraceback:\n{full_tb}",
             )
         finally:
             try:
@@ -364,7 +387,7 @@ class PawBenchBackend(BenchmarkBackend):
             except Exception:
                 pass
             docker_images_save_dir = agent_config.get("docker_images_save_dir")
-            if docker_images_save_dir and env.container_id:
+            if not _use_local and docker_images_save_dir and getattr(env, "container_id", None):
                 _save_docker_image(container_name, task.task_id, Path(docker_images_save_dir))
             try:
                 await env.stop()
@@ -372,25 +395,6 @@ class PawBenchBackend(BenchmarkBackend):
                 pass
 
         transcript = agent.extract_transcript(local_workspace, stdout_output)
-
-        # Prepend a system message when the agent captured a system prompt
-        # during post_run_collect() and the transcript doesn't already open
-        # with one (openclaw handles its own injection via trajectory JSONL).
-        system_prompt = agent.get_system_prompt()
-        if system_prompt and transcript:
-            first_role = ""
-            first_msg = transcript[0]
-            if first_msg.get("type") == "message":
-                first_role = (first_msg.get("message") or {}).get("role", "")
-            if first_role != "system":
-                transcript.insert(0, {
-                    "type": "message",
-                    "message": {
-                        "role": "system",
-                        "content": [{"type": "text", "text": system_prompt}],
-                    },
-                })
-
         execution_result: dict[str, Any] = {
             "agent_id": agent.name,
             "task_id": task.task_id,
@@ -403,6 +407,12 @@ class PawBenchBackend(BenchmarkBackend):
             "execution_time": time.time() - t0,
             "stdout": stdout_output,
             "stderr": "",
+        }
+
+        task_labels = {
+            k: task.frontmatter.get(k)
+            for k in ("scenario", "capabilities", "complexity", "modality", "environment")
+            if task.frontmatter.get(k) is not None
         }
 
         judge_api_key = agent_config.get("judge_api_key") or api_key
@@ -465,6 +475,9 @@ class PawBenchBackend(BenchmarkBackend):
                 else:
                     shutil.rmtree(local_workspace, ignore_errors=True)
 
+        # Inject transcript_length so anomaly rules that gate on it (e.g.
+        # EMPTY_TRANSCRIPT) receive the real value rather than defaulting to 0.
+        execution_result["transcript_length"] = len(transcript)
         anomaly = detect_anomalies(execution_result, grade_notes)
 
         return TaskResult(
@@ -477,16 +490,74 @@ class PawBenchBackend(BenchmarkBackend):
             notes=grade_notes,
             execution_time=execution_result["execution_time"],
             status=execution_result["status"],
-            usage={},
+            usage=_extract_usage_from_transcript(transcript, model=agent_config.get("model")),
             transcript_length=len(transcript),
             timed_out=False,
             transcript=transcript,
             anomaly=anomaly,
-            labels=getattr(task, "labels", {}),
+            labels=task_labels,
         )
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
+def _extract_usage_from_transcript(
+    transcript: list,
+    model: str | None = None,
+) -> dict[str, int]:
+    """Sum token usage across all events in a transcript.
+
+    First tries to read ``event["message"]["usage"]`` fields returned by the
+    agent SDK (exact counts).  If the transcript contains no usage data —
+    common when running via AP platform where agents don't propagate token
+    counts — falls back to offline tiktoken estimation via
+    :func:`pawbench.utils.token_counter.estimate_usage_from_transcript`.
+
+    Handles all key styles used by current agent parsers:
+
+    * OpenAI snake_case    – ``prompt_tokens``  / ``completion_tokens``
+    * Anthropic snake_case – ``input_tokens``   / ``output_tokens``
+    * OpenClaw camelCase   – ``inputTokens``    / ``outputTokens``
+
+    Returns ``{}`` when no usage data is present *and* tiktoken is not
+    available, so callers can test ``if r.usage`` to detect whether any token
+    information was captured.  When the estimate path is used the returned
+    dict includes ``"estimated": True`` to indicate the values are derived
+    from text rather than the API response.
+    """
+    prompt = 0
+    completion = 0
+    for event in transcript:
+        if not isinstance(event, dict):
+            continue
+        msg = event.get("message") if isinstance(event.get("message"), dict) else event
+        usage = msg.get("usage") if isinstance(msg, dict) else None
+        if not isinstance(usage, dict):
+            continue
+        prompt += int(
+            usage.get("prompt_tokens") or
+            usage.get("input_tokens") or
+            usage.get("inputTokens") or 0
+        )
+        completion += int(
+            usage.get("completion_tokens") or
+            usage.get("output_tokens") or
+            usage.get("outputTokens") or 0
+        )
+    if prompt or completion:
+        return {
+            "prompt_tokens": prompt,
+            "completion_tokens": completion,
+            "total_tokens": prompt + completion,
+        }
+
+    # ── Fallback: offline tiktoken estimation ─────────────────────────────────
+    try:
+        from .utils.token_counter import estimate_usage_from_transcript
+        return estimate_usage_from_transcript(transcript, model=model)
+    except Exception:
+        return {}
+
 
 def _save_docker_image(container_name: str, task_id: str, save_dir: Path) -> None:
     """Commit a running container and export it as a .tar file.

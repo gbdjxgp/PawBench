@@ -80,6 +80,8 @@ export default function App() {
     avg:   t('leaderboard.matrix.avg', 'Avg'),
     delta: 'Δ',
     none:  '—',
+    textOnlyBadge: t('leaderboard.matrix.textOnlyBadge', 'text-only'),
+    textOnlyNote:  t('leaderboard.matrix.note', ''),
   };
 
   const tableLabels = {
@@ -106,7 +108,8 @@ export default function App() {
       'bucket.help':      t('slice.bucket.help'),
       'pivot.summary':    t('slice.pivot.summary'),
       'pivot.taskCount':  t('slice.pivot.taskCount'),
-      'pivot.bestCol':    t('slice.pivot.bestCol'),
+      'pivot.avgCol':     t('slice.pivot.avgCol'),
+      'pivot.rowAvg':     t('leaderboard.matrix.avg'),
       noModelData:        t('slice.noModelData'),
     },
   };
