@@ -2,6 +2,7 @@
 """QwenPaw agent — installs and drives the qwenpaw HTTP server inside a Docker container."""
 
 import json
+import os
 import time
 from typing import Any, Dict
 
@@ -17,7 +18,7 @@ _SERVER_URL = "http://127.0.0.1:8088"
 
 # Default qwenpaw package version to install when the binary is absent from
 # the image.  Override per-task via agent config key "qwenpaw_version".
-_DEFAULT_QWENPAW_VERSION = "1.1.5.post2"
+_DEFAULT_QWENPAW_VERSION = "1.1.3"
 
 # Map our ProviderType to qwenpaw's builtin provider IDs and chat_model values.
 # Builtin providers are pre-registered in qwenpaw; only api_key / model need to
@@ -60,62 +61,28 @@ class QwenPawAgent(ContainerAgent):
 
     # ── config ────────────────────────────────────────────────────────────────
 
-    def _provider_env_exports(self) -> str:
-        """Return shell export statements for provider-specific API key/base_url env vars.
-
-        Each provider SDK reads its own env vars as a fallback when no credentials
-        are supplied programmatically.  We set provider-specific vars so that both
-        the server startup env and call_agent.py execution env are correct,
-        without cross-pollinating unrelated providers with wrong URLs.
-        """
-        k = self._api_key
-        u = self._base_url
-        provider = self._model_config.provider if self._model_config else None
-
-        _openai_compat = {ProviderType.OPENAI, ProviderType.DASHSCOPE, ProviderType.CUSTOM, None}
-
-        if provider in _openai_compat:
-            # OpenAI-compatible providers (openai / dashscope / custom rl-server):
-            # OPENAI_BASE_URL is the standard env var for these SDKs.
-            parts = [
-                f"export OPENAI_API_KEY='{k}'",
-                f"export OPENAI_BASE_URL='{u}'",
-                f"export DASHSCOPE_API_KEY='{k}'",
-            ]
-        elif provider == ProviderType.ANTHROPIC:
-            parts = [
-                f"export ANTHROPIC_API_KEY='{k}'",
-            ]
-            if u:
-                parts.append(f"export ANTHROPIC_BASE_URL='{u}'")
-        elif provider == ProviderType.GOOGLE:
-            parts = [
-                f"export GOOGLE_API_KEY='{k}'",
-                f"export GEMINI_API_KEY='{k}'",
-            ]
-            if u:
-                parts.append(f"export GEMINI_API_BASE='{u}'")
-        elif provider == ProviderType.AZURE:
-            parts = [
-                f"export AZURE_OPENAI_API_KEY='{k}'",
-                f"export OPENAI_API_KEY='{k}'",
-            ]
-            if u:
-                parts.append(f"export AZURE_OPENAI_ENDPOINT='{u}'")
-        else:
-            parts = [
-                f"export OPENAI_API_KEY='{k}'",
-                f"export OPENAI_BASE_URL='{u}'",
-            ]
-        return " && ".join(parts)
-
     def _compute_config(self) -> None:
         """Resolve model / api_key / base_url / generate_kwargs and store as instance vars."""
         model_identifier = self.config.get("model", "dashscope/qwen3.6-plus")
-        rc = get_model_config(model_identifier).resolve_with(self.config)
-        self._model_config = rc.model_config
-        self._api_key = rc.api_key
-        self._base_url = rc.base_url
+        self._model_config = get_model_config(model_identifier)
+        self._api_key = (
+            self.config.get("api_key")
+            or self._model_config.api_key
+            or os.environ.get("OPENAI_API_KEY", "")
+        )
+        raw_url = self.config.get("base_url") or self._model_config.base_url or ""
+        # Normalize: OpenAI-compatible custom endpoints need /v1 suffix so that
+        # qwenpaw's image probe hits /v1/chat/completions (correct path).
+        # Without /v1, probe goes to /chat/completions → unexpected response →
+        # AttributeError → model marked UNAVAILABLE → global-fallback.
+        # Skip normalization for dashscope and anthropic (they manage their own paths).
+        if raw_url and self._model_config.provider not in (
+            ProviderType.DASHSCOPE, ProviderType.ANTHROPIC, ProviderType.GOOGLE
+        ):
+            stripped = raw_url.rstrip("/")
+            if not stripped.endswith("/v1"):
+                raw_url = stripped + "/v1"
+        self._base_url = raw_url
         # generate_kwargs can be set in agent config (e.g. {"temperature": 0})
         # and is forwarded to qwenpaw's provider via PUT /models/{id}/config.
         self._generate_kwargs = self.config.get("generate_kwargs") or {}
@@ -313,10 +280,61 @@ __PYEOF__
         )
         await environment.execute_command(xvfb_cmd, timeout=60)
 
+    # Startup script written to /tmp/qwenpaw_start.py inside the container.
+    # Monkey-patches _resolve_content_url so that local image file paths are
+    # converted to base64 data URLs before being forwarded to the LLM API.
+    # DashScope (and most OpenAI-compatible endpoints) reject bare filesystem
+    # paths like "/app/working/…/image.jpg", but accept "data:image/jpeg;base64,…".
+    _QWENPAW_START_SCRIPT = """\
+import base64
+import mimetypes
+import os
+import sys
+
+# ── monkey-patch: local image path → base64 data URL ──────────────────────
+try:
+    import qwenpaw.app.runner.utils as _qw_utils
+
+    _orig_resolve = _qw_utils._resolve_content_url
+
+    def _patched_resolve_content_url(url: str) -> str:
+        resolved = _orig_resolve(url)
+        if (
+            resolved
+            and isinstance(resolved, str)
+            and not resolved.startswith(("http://", "https://", "data:"))
+            and os.path.isfile(resolved)
+        ):
+            mime, _ = mimetypes.guess_type(resolved)
+            if mime and mime.startswith("image/"):
+                if mime == "image/jpg":
+                    mime = "image/jpeg"
+                with open(resolved, "rb") as _f:
+                    data = base64.b64encode(_f.read()).decode("utf-8")
+                return f"data:{mime};base64,{data}"
+        return resolved
+
+    _qw_utils._resolve_content_url = _patched_resolve_content_url
+except Exception:
+    pass  # monkey-patch is optional; skip if qwenpaw internals changed
+
+# ── start qwenpaw app ──────────────────────────────────────────────────────
+sys.argv = ["qwenpaw", "app", "--host", "127.0.0.1", "--port", "8088"]
+from qwenpaw.__main__ import cli  # noqa: E402
+
+cli()
+"""
+
     async def _start_server(self, environment: BaseEnvironment) -> None:
         """Start the qwenpaw HTTP server (127.0.0.1:8088) and wait until ready."""
+        api_key = self._api_key
+        base_url = self._base_url
+        # Write the startup script (with image base64 monkey-patch) to the container.
+        await environment.write_file("/tmp/qwenpaw_start.py", self._QWENPAW_START_SCRIPT)
         server_cmd = (
-            self._provider_env_exports() + " && "
+            f"export OPENAI_API_KEY='{api_key}' && "
+            f"export OPENAI_BASE_URL='{base_url}' && "
+            f"export DASHSCOPE_API_KEY='{api_key}' && "
             f"export QWENPAW_WORKING_DIR='{_WORKING_DIR}' && "
             f"export COPAW_WORKING_DIR='{_WORKING_DIR}' && "
             f"export QWENPAW_SECRET_DIR='{_SECRET_DIR}' && "
@@ -324,7 +342,7 @@ __PYEOF__
             "export QWENPAW_TOOL_GUARD_ENABLED=false && "
             "export DISPLAY=${DISPLAY:-:1} && "
             "export DBUS_SESSION_BUS_ADDRESS=${DBUS_SESSION_BUS_ADDRESS:-} && "
-            "nohup qwenpaw app --host 127.0.0.1 --port 8088 "
+            "nohup python3 /tmp/qwenpaw_start.py "
             ">/tmp/qwenpaw_server.log 2>&1 & "
             "echo $! > /tmp/qwenpaw_server.pid && "
             # Use /api/version (same as setup_provider._detect_api_base) for readiness.
@@ -363,7 +381,8 @@ __PYEOF__
 
         inner_timeout = int(self.config.get("task_timeout_s") or 1800)
         run_cmd = (
-            self._provider_env_exports() + " && "
+            f"export OPENAI_API_KEY='{self._api_key}' && "
+            f"export DASHSCOPE_API_KEY='{self._api_key}' && "
             f"export QWENPAW_WORKING_DIR='{_WORKING_DIR}' && "
             f"export COPAW_WORKING_DIR='{_WORKING_DIR}' && "
             f"export QWENPAW_SECRET_DIR='{_SECRET_DIR}' && "
@@ -426,15 +445,6 @@ __PYEOF__
         base_url = self._base_url
         generate_kwargs_from_config = self._generate_kwargs
 
-        # Pre-compute model_entry on the host side using ModelConfig as single
-        # source of truth for vision capability — no string-matching heuristics
-        # inside the generated script.
-        _mm: dict = (
-            {"supports_multimodal": True, "supports_image": True, "supports_video": True}
-            if model_config.supports_vision else {}
-        )
-        _model_entry_literal = json.dumps({"id": model_name, "name": model_name, **_mm})
-
         builtin_info = _BUILTIN_PROVIDER_MAP.get(model_config.provider)
         is_builtin = builtin_info is not None
         if is_builtin:
@@ -491,8 +501,13 @@ __PYEOF__
             "    except Exception:\n"
             "        print('[generate_kwargs] invalid AUTO_EVAL_GENERATE_KWARGS, ignored', flush=True)\n"
             "\n"
-            "# ── 3. Multimodal metadata (pre-computed from model config) ──────\n"
-            + f"model_entry = {_model_entry_literal}\n"
+            "# ── 3. Multimodal metadata ─────────────────────────────────────\n"
+            "# Declare vision up front so qwenpaw skips the flaky red-PNG color\n"
+            "# probe (RL/custom endpoints often fail it despite supporting images).\n"
+            "# Builtin DashScope models use qwenpaw's own registry; this applies to\n"
+            "# custom providers (rl-server, etc.) registered below.\n"
+            "mm = {'supports_multimodal': True, 'supports_image': True, 'supports_video': True}\n"
+            "model_entry = {'id': MODEL_ID, 'name': MODEL_ID, **mm}\n"
             "\n"
             "# ── 4. Configure provider via HTTP API ─────────────────────────\n"
             "if IS_BUILTIN:\n"

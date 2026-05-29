@@ -28,16 +28,6 @@ class BaseAgent(abc.ABC):
     @abc.abstractmethod
     def version(self) -> Optional[str]: ...
 
-    def get_system_prompt(self) -> Optional[str]:
-        """Return the system prompt used for this agent's last run.
-
-        Subclasses populate ``self._last_system_prompt`` inside
-        ``post_run_collect()`` (while the container is still reachable) so
-        that ``backend.py`` can prepend it to the transcript after the
-        container stops.  The default implementation returns ``None``.
-        """
-        return getattr(self, "_last_system_prompt", None)
-
 
 class ContainerAgent(BaseAgent):
     """Base for agents that need installation inside the environment."""
@@ -61,6 +51,16 @@ class ContainerAgent(BaseAgent):
         standard workspace path before the backend does ``docker cp``.
         The default implementation is a no-op.
         """
+
+    def get_system_prompt(self) -> Optional[str]:
+        """Return the system prompt used for this agent's last run.
+
+        Subclasses populate ``self._last_system_prompt`` inside
+        ``post_run_collect()`` (while the container is still reachable) so
+        that ``backend.py`` can prepend it to the transcript after the
+        container stops.  The default implementation returns ``None``.
+        """
+        return getattr(self, "_last_system_prompt", None)
 
     def extract_transcript(
         self,

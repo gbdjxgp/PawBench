@@ -24,11 +24,14 @@ class BenchmarkRunner:
     """Run a native benchmark backend against one agent configuration.
 
     Args:
-        backend:     An instantiated :class:`BenchmarkBackend`.
-        results_dir: Directory where JSON result files are written.
-        concurrency: Maximum number of tasks to execute in parallel.
-        max_retries: How many times to retry a failed or timed-out task
-                     before giving up (default 1 = no retry).
+        backend:       An instantiated :class:`BenchmarkBackend`.
+        results_dir:   Directory where JSON result files are written.
+        concurrency:   Maximum number of tasks to execute in parallel.
+        max_retries:   How many times to retry a failed or timed-out task
+                       before giving up (default 3).
+        runs_per_task: Run each task this many times and aggregate
+                       mean/std/min/max + pass@k (default 1).  Mirrors the
+                       ``--runs`` option of the original QwenClawBench runner.
     """
 
     def __init__(
@@ -36,13 +39,15 @@ class BenchmarkRunner:
         backend: BenchmarkBackend,
         results_dir: str | Path = "./results",
         concurrency: int = 1,
-        max_retries: int = 1,
+        max_retries: int = 3,
+        runs_per_task: int = 1,
     ) -> None:
         self.backend = backend
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.concurrency = max(1, concurrency)
         self.max_retries = max(1, max_retries)
+        self.runs_per_task = max(1, runs_per_task)
 
     # ── public API ────────────────────────────────────────────────────────────
 
@@ -54,6 +59,11 @@ class BenchmarkRunner:
     ) -> list[TaskResult]:
         """Execute all (or filtered) tasks and return results.
 
+        When ``runs_per_task > 1``, each task is executed that many times and
+        the results are aggregated (mean/std/min/max per task, pass@k over the
+        whole run).  This matches the ``--runs N`` semantics of the original
+        QwenClawBench benchmark runner.
+
         Args:
             agent_config: Dict passed to ``backend.run_and_grade()``.
                           Must contain at minimum ``"model"``.
@@ -61,13 +71,20 @@ class BenchmarkRunner:
             **load_kwargs: Extra kwargs forwarded to ``backend.load_tasks()``
                            (e.g. ``dataset="..."`` for QwenClawBench).
         """
+        import statistics
+
         tasks = self.backend.load_tasks(task_filter, **load_kwargs)
         if not tasks:
             print(f"[{self.backend.name}] No tasks loaded — nothing to run.")
             return []
 
-        print(f"[{self.backend.name}] {len(tasks)} task(s) loaded"
-              + (f", filter={task_filter}" if task_filter else ""))
+        n_runs = self.runs_per_task
+        total_work = len(tasks) * n_runs
+        print(
+            f"[{self.backend.name}] {len(tasks)} task(s) loaded"
+            + (f", filter={task_filter}" if task_filter else "")
+            + (f", runs_per_task={n_runs}" if n_runs > 1 else "")
+        )
 
         # Generate stable paths before any task runs so checkpoints accumulate
         # in the same file even if the process is interrupted mid-run.
@@ -76,7 +93,9 @@ class BenchmarkRunner:
         transcripts_dir = self.results_dir / "transcripts"
         transcripts_dir.mkdir(parents=True, exist_ok=True)
 
-        results: list[TaskResult] = []
+        # all_results[task_id] = list of TaskResult (one per run)
+        all_results: dict[str, list[TaskResult]] = {t.task_id: [] for t in tasks}
+        flat_results: list[TaskResult] = []
 
         workspaces_dir: Path | None = None
         if agent_config.get("save_workspace"):
@@ -88,34 +107,42 @@ class BenchmarkRunner:
             docker_images_dir = self.results_dir / "docker_images"
             docker_images_dir.mkdir(parents=True, exist_ok=True)
 
+        # Build work items: (task, run_index 1-based) in order
+        work_items = [
+            (task, run_idx)
+            for task in tasks
+            for run_idx in range(1, n_runs + 1)
+        ]
+        done_so_far = 0
+
         if self.concurrency == 1:
-            for idx, task in enumerate(tasks, 1):
-                print(f"\n  [{idx}/{len(tasks)}] {task.task_id}")
-                cfg = {**agent_config, "run_id": str(idx)}
+            for task, run_idx in work_items:
+                done_so_far += 1
+                label = f"{task.task_id}" + (f" [run {run_idx}/{n_runs}]" if n_runs > 1 else "")
+                print(f"\n  [{done_so_far}/{total_work}] {label}")
+                cfg = {**agent_config, "run_id": f"{task.task_id}_r{run_idx}"}
                 if workspaces_dir is not None:
                     cfg["workspace_save_dir"] = str(workspaces_dir)
                 if docker_images_dir is not None:
                     cfg["docker_images_save_dir"] = str(docker_images_dir)
                 result = await self._run_with_retry(task, cfg)
-                results.append(result)
-                # Persist transcript and checkpoint immediately so a crash or
-                # interrupt does not lose already-completed task data.
-                _save_transcript(result, transcripts_dir)
-                _write_checkpoint(results, agent_config, self.backend.name, checkpoint_path)
-                # Bar reflects tasks completed so far (idx/len) after this one finishes
-                self._print_progress_line(idx, len(tasks), task.task_id)
+                all_results[task.task_id].append(result)
+                flat_results.append(result)
+                _save_transcript(result, transcripts_dir, run_idx=run_idx if n_runs > 1 else None)
+                _write_checkpoint(flat_results, agent_config, self.backend.name, checkpoint_path)
+                self._print_progress_line(done_so_far, total_work, label)
                 self._print_result(result)
         else:
             sem = asyncio.Semaphore(self.concurrency)
             progress_lock = asyncio.Lock()
-            n_tasks = len(tasks)
-            done_count: list[int] = [0]  # mutable cell for async closure
+            done_count: list[int] = [0]
 
-            async def bounded(task: Any, idx: int) -> TaskResult:
+            async def bounded(task: Any, run_idx: int) -> TaskResult:
                 result: TaskResult
+                label = f"{task.task_id}" + (f" [run {run_idx}/{n_runs}]" if n_runs > 1 else "")
                 try:
                     async with sem:
-                        cfg = {**agent_config, "run_id": str(idx)}
+                        cfg = {**agent_config, "run_id": f"{task.task_id}_r{run_idx}"}
                         if workspaces_dir is not None:
                             cfg["workspace_save_dir"] = str(workspaces_dir)
                         if docker_images_dir is not None:
@@ -126,59 +153,85 @@ class BenchmarkRunner:
                 async with progress_lock:
                     done_count[0] += 1
                     cur = done_count[0]
-                    # Accumulate into the shared list before writing so each
-                    # checkpoint contains ALL results completed so far, not just
-                    # the current one (results + [result] would only write one
-                    # entry per flush because results is empty until gather
-                    # returns).
-                    results.append(result)
-                    _save_transcript(result, transcripts_dir)
-                    _write_checkpoint(results, agent_config,
-                                      self.backend.name, checkpoint_path)
-                # Print as each task *finishes* (completion order), with a
-                # one-line bar so logs show live progress (unlike a batched gather).
-                self._print_progress_line(cur, n_tasks, task.task_id)
+                    all_results[task.task_id].append(result)
+                    flat_results.append(result)
+                    _save_transcript(result, transcripts_dir, run_idx=run_idx if n_runs > 1 else None)
+                    _write_checkpoint(flat_results, agent_config, self.backend.name, checkpoint_path)
+                self._print_progress_line(cur, total_work, label)
                 self._print_result(result)
                 return result
 
             gathered = await asyncio.gather(
-                *[bounded(t, i + 1) for i, t in enumerate(tasks)],
+                *[bounded(task, run_idx) for task, run_idx in work_items],
                 return_exceptions=True,
             )
-            # results already populated inside bounded() under progress_lock.
-            # Only handle tasks that raised an unexpected BaseException (they
-            # were not appended there) to keep the list complete.
-            completed_ids = {r.task_id for r in results}
-            for task, outcome in zip(tasks, gathered):
+            for (task, run_idx), outcome in zip(work_items, gathered):
                 if isinstance(outcome, BaseException):
-                    results.append(_error_result(task, str(outcome)))
-                elif task.task_id not in completed_ids:
-                    results.append(outcome)
-            # per-task output already printed inside bounded (skip duplicate _print_result)
+                    r = _error_result(task, str(outcome))
+                    all_results[task.task_id].append(r)
+                    flat_results.append(r)
 
-        self._print_summary(results)
-        self._save_results(results, agent_config, checkpoint_path, transcripts_dir)
-        return results
+        # Aggregate per-task stats when runs_per_task > 1
+        task_stats: dict[str, dict[str, Any]] = {}
+        if n_runs > 1:
+            from .grader import pass_k_stats
+            for t in tasks:
+                runs = all_results[t.task_id]
+                scores = [r.score for r in runs]
+                task_stats[t.task_id] = {
+                    "runs": n_runs,
+                    "mean": statistics.mean(scores) if scores else 0.0,
+                    "std": statistics.stdev(scores) if len(scores) > 1 else 0.0,
+                    "min": min(scores) if scores else 0.0,
+                    "max": max(scores) if scores else 0.0,
+                    "scores": scores,
+                }
+            # pass@k — convert scores list to the format expected by pass_k_stats
+            grades_for_pk = {
+                tid: {"runs": [{"score": sc} for sc in s["scores"]]}
+                for tid, s in task_stats.items()
+            }
+            pk = pass_k_stats(grades_for_pk, n_runs)
+        else:
+            pk = {}
+
+        self._print_summary(flat_results, task_stats=task_stats, pass_k=pk)
+        self._save_results(
+            flat_results, agent_config, checkpoint_path, transcripts_dir,
+            task_stats=task_stats, pass_k=pk,
+        )
+        return flat_results
 
     # ── internals ─────────────────────────────────────────────────────────────
 
     async def _run_with_retry(self, task: Any, cfg: dict[str, Any]) -> TaskResult:
         """Execute a task with up to ``self.max_retries`` attempts.
 
-        A retry is triggered when the result carries ``status == "error"``
-        or ``timed_out == True``.  Passing results (score > 0 or
-        status == "success") are returned immediately without further attempts.
+        A retry is triggered when:
+        * ``status == "error"`` or ``timed_out == True`` (execution failure), OR
+        * ``anomaly.has_error`` is True (infrastructure failure detected after
+          a nominally "successful" run, e.g. TERMINAL_API_FAILURE caused by
+          API quota exhaustion mid-task).
+
+        Passing results with no anomaly errors are returned immediately.
         """
         last: TaskResult | None = None
         for attempt in range(1, self.max_retries + 1):
             if attempt > 1:
                 print(f"    ↻ retry {attempt}/{self.max_retries} for {task.task_id}")
             last = await self._run_one(task, cfg)
-            # Stop retrying on success or a meaningful score
-            if last.status not in ("error",) and not last.timed_out:
+            execution_failed = last.status in ("error",) or last.timed_out
+            anomaly_error = last.anomaly.get("has_error", False)
+            if not execution_failed and not anomaly_error:
                 return last
             if attempt < self.max_retries:
-                reason = "timed_out" if last.timed_out else f"status={last.status}"
+                if last.timed_out:
+                    reason = "timed_out"
+                elif execution_failed:
+                    reason = f"status={last.status}"
+                else:
+                    ids = [i["id"] for i in last.anomaly.get("items", []) if i.get("severity") == "error"]
+                    reason = f"anomaly_errors=[{', '.join(ids[:3])}]"
                 print(f"    ! attempt {attempt} failed ({reason}), will retry…")
         return last  # type: ignore[return-value]
 
@@ -218,13 +271,24 @@ class BenchmarkRunner:
             f"[{r.grading_type}]",
             f"status={r.status}",
         ]
+        if r.usage.get("total_tokens"):
+            parts.append(f"tokens={r.usage['total_tokens']:,}")
         if r.notes:
             parts.append(r.notes[:80])
         if r.error:
             parts.append(f"ERR:{r.error[:60]}")
+        if r.anomaly.get("is_anomalous"):
+            ids = [i["id"] for i in r.anomaly.get("items", [])]
+            severity = "ERR" if r.anomaly.get("has_error") else "WARN"
+            parts.append(f"[{severity}:{','.join(ids[:3])}]")
         print("  ".join(parts))
 
-    def _print_summary(self, results: list[TaskResult]) -> None:
+    def _print_summary(
+        self,
+        results: list[TaskResult],
+        task_stats: dict[str, Any] | None = None,
+        pass_k: dict[str, Any] | None = None,
+    ) -> None:
         n = len(results)
         if n == 0:
             return
@@ -232,15 +296,33 @@ class BenchmarkRunner:
         avg = sum(r.score for r in results) / n
         total_time = sum(r.execution_time for r in results)
         bench = self.backend.name.upper()
+        usage = _sum_usage(results)
 
         print(f"\n{'='*70}")
-        print(f"  {bench} — {n} task(s)  passed={passed}/{n}  "
+        print(f"  {bench} — {n} run(s)  passed={passed}/{n}  "
               f"avg_score={avg:.3f}  total_time={total_time:.1f}s")
+        if usage["total_tokens"]:
+            print(
+                f"  tokens: prompt={usage['prompt_tokens']:,}  "
+                f"completion={usage['completion_tokens']:,}  "
+                f"total={usage['total_tokens']:,}"
+            )
+        if pass_k:
+            for k, v in sorted(pass_k.items()):
+                print(f"  {k}: {v:.4f}")
         print("="*70)
-        for r in sorted(results, key=lambda x: x.task_id):
-            mark = "✓" if r.passed else "✗"
-            pct = r.score / r.max_score * 100 if r.max_score > 0 else 0.0
-            print(f"  {mark}  {r.task_id:<35}  {pct:5.1f}%  {r.status}")
+        if task_stats:
+            for tid, s in sorted(task_stats.items()):
+                print(
+                    f"  {tid:<40}  mean={s['mean']:.3f}  "
+                    f"std={s['std']:.3f}  min={s['min']:.3f}  max={s['max']:.3f}"
+                )
+        else:
+            for r in sorted(results, key=lambda x: x.task_id):
+                mark = "✓" if r.passed else "✗"
+                pct = r.score / r.max_score * 100 if r.max_score > 0 else 0.0
+                tok = f"  {r.usage['total_tokens']:>8,} tok" if r.usage.get("total_tokens") else ""
+                print(f"  {mark}  {r.task_id:<35}  {pct:5.1f}%  {r.status}{tok}")
         print("="*70)
 
         _print_label_report(results)
@@ -251,6 +333,8 @@ class BenchmarkRunner:
         agent_config: dict[str, Any],
         out_path: Path | None = None,
         transcripts_dir: Path | None = None,
+        task_stats: dict[str, Any] | None = None,
+        pass_k: dict[str, Any] | None = None,
     ) -> None:
         bench = self.backend.name
         model = agent_config.get("model", "unknown")
@@ -261,7 +345,10 @@ class BenchmarkRunner:
             transcripts_dir = self.results_dir / "transcripts"
             transcripts_dir.mkdir(parents=True, exist_ok=True)
 
-        _write_checkpoint(results, agent_config, bench, out_path)
+        _write_checkpoint(
+            results, agent_config, bench, out_path,
+            task_stats=task_stats, pass_k=pass_k,
+        )
         print(f"\n  Results → {out_path}")
 
         # Save any transcripts not yet persisted by the per-task checkpoint path.
@@ -285,6 +372,13 @@ class BenchmarkRunner:
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _error_result(task: Any, error: str, elapsed: float = 0.0) -> TaskResult:
+    labels = {}
+    if hasattr(task, "frontmatter") and isinstance(task.frontmatter, dict):
+        labels = {
+            k: task.frontmatter[k]
+            for k in ("scenario", "capabilities", "complexity", "modality", "environment")
+            if task.frontmatter.get(k) is not None
+        }
     return TaskResult(
         task_id=task.task_id,
         task_name=getattr(task, "task_name", getattr(task, "name", task.task_id)),
@@ -300,37 +394,123 @@ def _error_result(task: Any, error: str, elapsed: float = 0.0) -> TaskResult:
         transcript_length=0,
         timed_out=False,
         error=error,
+        labels=labels,
     )
 
 
-def _save_transcript(result: TaskResult, transcripts_dir: Path) -> None:
-    """Write a single task's transcript to ``transcripts_dir/{task_id}.jsonl``.
+def _save_transcript(
+    result: TaskResult,
+    transcripts_dir: Path,
+    run_idx: int | None = None,
+) -> None:
+    """Write a single task's transcript to ``transcripts_dir/{task_id}[_runN].jsonl``.
 
-    Called immediately after each task finishes so data is not lost if the
-    process is interrupted before ``_save_results`` runs.  Overwrites any
-    pre-existing file (idempotent for retries).
+    When *run_idx* is provided (multi-run mode), the file is named
+    ``{task_id}_run{run_idx}.jsonl`` so successive runs don't overwrite each
+    other.  Called immediately after each task finishes.
     """
     if not result.transcript:
         return
-    traj_path = transcripts_dir / f"{result.task_id}.jsonl"
+    suffix = f"_run{run_idx}" if run_idx is not None else ""
+    traj_path = transcripts_dir / f"{result.task_id}{suffix}.jsonl"
     with open(traj_path, "w", encoding="utf-8") as fh:
         for entry in result.transcript:
             fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
+def _write_checkpoint(
+    results: list[TaskResult],
+    agent_config: dict[str, Any],
+    bench_name: str,
+    out_path: Path,
+    task_stats: dict[str, Any] | None = None,
+    pass_k: dict[str, Any] | None = None,
+) -> None:
+    """Overwrite *out_path* with all results accumulated so far.
+
+    When *task_stats* is provided (runs_per_task > 1), the checkpoint also
+    includes per-task mean/std/min/max and pass@k statistics, matching the
+    output schema of the original QwenClawBench ``summary.json``.
+    """
+    model = agent_config.get("model", "unknown")
+    n_results = len(results)
+    runs_per_task = n_results // len({r.task_id for r in results}) if results else 1
+    avg_score = sum(r.score for r in results) / n_results if n_results else 0.0
+    usage_total = _sum_usage(results)
+
+    passed_count = sum(1 for r in results if r.passed)
+    total_time = sum(r.execution_time for r in results)
+    summary: dict[str, Any] = {
+        "total_runs": n_results,
+        "tasks_completed": len({r.task_id for r in results}),
+        "passed": passed_count,
+        "pass_rate": round(passed_count / n_results, 4) if n_results else 0.0,
+        "avg_score": avg_score,
+        "runs_per_task": runs_per_task,
+        "total_time": round(total_time, 3),
+        "avg_execution_time": round(total_time / n_results, 3) if n_results else 0.0,
+        "total_usage": usage_total,
+        "errors": {
+            "total": sum(1 for r in results if r.status == "error"),
+            "timed_out": sum(1 for r in results if r.timed_out),
+            "failed": sum(1 for r in results if r.status == "error" and not r.timed_out),
+        },
+        "by_label": _build_label_summary(results),
+    }
+    if pass_k:
+        summary.update(pass_k)
+
+    payload: dict[str, Any] = {
+        "benchmark": bench_name,
+        "model": model,
+        "timestamp": datetime.now().isoformat(),
+        "summary": summary,
+        "results": [
+            {
+                "task_id": r.task_id,
+                "task_name": r.task_name,
+                "score": r.score,
+                "max_score": r.max_score,
+                "passed": r.passed,
+                "grading_type": r.grading_type,
+                "breakdown": r.breakdown,
+                "notes": r.notes,
+                "execution_time": r.execution_time,
+                "status": r.status,
+                "usage": r.usage,
+                "transcript_length": r.transcript_length,
+                "timed_out": r.timed_out,
+                "error": r.error,
+                "anomaly": r.anomaly,
+                "labels": r.labels,
+            }
+            for r in results
+        ],
+    }
+    if task_stats:
+        payload["task_stats"] = task_stats
+
+    # Write atomically via a temp file to avoid a corrupt file if interrupted
+    # mid-write.
+    tmp = out_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    tmp.replace(out_path)
+
+
+# ── label-dimension helpers ───────────────────────────────────────────────────
+
 def _build_label_summary(results: list[TaskResult]) -> dict[str, Any]:
     """Aggregate pass-rate and avg-score for every label dimension value.
 
-    Returns a dict keyed by dimension name (``capabilities``, ``modality``,
-    ``scenario``, ``complexity``, ``environment``).  Each value is a dict
-    keyed by the label value, containing ``total``, ``passed``, and
-    ``avg_score``.
+    Returns a dict keyed by dimension name (``capabilities``, ``modality_type``,
+    ``modality_channel``, ``scenario``, ``complexity``, ``environment``).
+    Each value is a dict keyed by the label value with ``total``, ``passed``,
+    ``pass_rate``, and ``avg_score``.
 
-    For list-valued dimensions (``capabilities``) every element in the list
-    is treated as an independent key so a task tagged with both ``Tool_Use``
-    and ``Code_Manipulation`` contributes to both buckets.
+    For list-valued dimensions (``capabilities``) every element is treated as
+    an independent key so a task tagged with both ``Tool_Use`` and
+    ``Code_Manipulation`` contributes to both buckets.
     """
-    # dimension name → label value → {total, passed, score_sum}
     buckets: dict[str, dict[str, dict[str, Any]]] = defaultdict(
         lambda: defaultdict(lambda: {"total": 0, "passed": 0, "score_sum": 0.0})
     )
@@ -338,28 +518,26 @@ def _build_label_summary(results: list[TaskResult]) -> dict[str, Any]:
     for r in results:
         labels = r.labels or {}
 
-        # capabilities — list of strings
         for cap in labels.get("capabilities") or []:
             b = buckets["capabilities"][str(cap)]
             b["total"] += 1
             b["passed"] += int(r.passed)
             b["score_sum"] += r.score
 
-        # modality — dict with a "type" key (and optional "channels" list)
         modality = labels.get("modality") or {}
         if modality:
-            mod_type = str(modality.get("type", "unknown"))
+            mod_type = str(modality.get("type", "unknown")) if isinstance(modality, dict) else str(modality)
             b = buckets["modality_type"][mod_type]
             b["total"] += 1
             b["passed"] += int(r.passed)
             b["score_sum"] += r.score
-            for ch in modality.get("channels") or []:
-                b2 = buckets["modality_channel"][str(ch)]
-                b2["total"] += 1
-                b2["passed"] += int(r.passed)
-                b2["score_sum"] += r.score
+            if isinstance(modality, dict):
+                for ch in modality.get("channels") or []:
+                    b2 = buckets["modality_channel"][str(ch)]
+                    b2["total"] += 1
+                    b2["passed"] += int(r.passed)
+                    b2["score_sum"] += r.score
 
-        # scenario — plain string
         scenario = labels.get("scenario")
         if scenario:
             b = buckets["scenario"][str(scenario)]
@@ -367,7 +545,6 @@ def _build_label_summary(results: list[TaskResult]) -> dict[str, Any]:
             b["passed"] += int(r.passed)
             b["score_sum"] += r.score
 
-        # complexity — plain string (e.g. "L1"–"L5")
         complexity = labels.get("complexity")
         if complexity:
             b = buckets["complexity"][str(complexity)]
@@ -375,7 +552,6 @@ def _build_label_summary(results: list[TaskResult]) -> dict[str, Any]:
             b["passed"] += int(r.passed)
             b["score_sum"] += r.score
 
-        # environment — plain string (e.g. "open", "closed")
         environment = labels.get("environment")
         if environment:
             b = buckets["environment"][str(environment)]
@@ -383,7 +559,6 @@ def _build_label_summary(results: list[TaskResult]) -> dict[str, Any]:
             b["passed"] += int(r.passed)
             b["score_sum"] += r.score
 
-    # Finalise: replace score_sum with avg_score
     out: dict[str, Any] = {}
     for dim, values in buckets.items():
         out[dim] = {}
@@ -398,6 +573,17 @@ def _build_label_summary(results: list[TaskResult]) -> dict[str, Any]:
     return out
 
 
+def _sum_usage(results: list[TaskResult]) -> dict[str, int]:
+    """Sum token usage across all task results."""
+    prompt = sum(r.usage.get("prompt_tokens", 0) for r in results)
+    completion = sum(r.usage.get("completion_tokens", 0) for r in results)
+    return {
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": prompt + completion,
+    }
+
+
 def _print_label_report(results: list[TaskResult]) -> None:
     """Print a human-readable breakdown of scores grouped by each label dimension."""
     summary = _build_label_summary(results)
@@ -405,12 +591,12 @@ def _print_label_report(results: list[TaskResult]) -> None:
         return
 
     dim_titles = {
-        "capabilities":      "Capabilities",
-        "modality_type":     "Modality (type)",
-        "modality_channel":  "Modality (channel)",
-        "scenario":          "Scenario",
-        "complexity":        "Complexity",
-        "environment":       "Environment",
+        "capabilities":     "Capabilities",
+        "modality_type":    "Modality (type)",
+        "modality_channel": "Modality (channel)",
+        "scenario":         "Scenario",
+        "complexity":       "Complexity",
+        "environment":      "Environment",
     }
 
     print(f"\n{'─'*70}")
@@ -439,61 +625,3 @@ def _print_label_report(results: list[TaskResult]) -> None:
             )
 
     print(f"{'─'*70}\n")
-
-
-def _write_checkpoint(
-    results: list[TaskResult],
-    agent_config: dict[str, Any],
-    bench_name: str,
-    out_path: Path,
-) -> None:
-    """Overwrite *out_path* with all results accumulated so far.
-
-    Using a fixed path (generated once per run) means partial runs survive
-    process crashes: the last checkpoint always contains everything up to the
-    most recently completed task.
-    """
-    model = agent_config.get("model", "unknown")
-    payload = {
-        "benchmark": bench_name,
-        "model": model,
-        "timestamp": datetime.now().isoformat(),
-        "summary": {
-            "total": len(results),
-            "passed": sum(1 for r in results if r.passed),
-            "avg_score": (
-                sum(r.score for r in results) / len(results) if results else 0.0
-            ),
-            "errors": {
-                "total": sum(1 for r in results if r.status == "error"),
-                "timed_out": sum(1 for r in results if r.timed_out),
-                "failed": sum(1 for r in results if r.status == "error" and not r.timed_out),
-            },
-            "by_label": _build_label_summary(results),
-        },
-        "results": [
-            {
-                "task_id": r.task_id,
-                "task_name": r.task_name,
-                "score": r.score,
-                "max_score": r.max_score,
-                "passed": r.passed,
-                "grading_type": r.grading_type,
-                "breakdown": r.breakdown,
-                "notes": r.notes,
-                "execution_time": r.execution_time,
-                "status": r.status,
-                "usage": r.usage,
-                "transcript_length": r.transcript_length,
-                "timed_out": r.timed_out,
-                "error": r.error,
-                "labels": r.labels,
-            }
-            for r in results
-        ],
-    }
-    # Write atomically via a temp file to avoid a corrupt file if interrupted
-    # mid-write.
-    tmp = out_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
-    tmp.replace(out_path)

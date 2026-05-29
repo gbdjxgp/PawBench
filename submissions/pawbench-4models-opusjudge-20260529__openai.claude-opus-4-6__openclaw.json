@@ -1,5 +1,5 @@
 {
-  "run": "pawbench-rerun-20260519",
+  "run": "pawbench-4models-opusjudge-20260529",
   "model": "claude-opus-4.6",
   "harness": "openclaw",
   "overall": 0.7611,
@@ -9,7 +9,7 @@
   "tasks_total": 150,
   "tasks_errored": 0,
   "missing_metadata": 0,
-  "updated": "2026-05-19",
+  "updated": "2026-05-29",
   "by_complexity": {
     "L3": 0.7568,
     "L2": 0.828,

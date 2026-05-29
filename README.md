@@ -2,11 +2,13 @@
 
 > Languages: **English** · [简体中文](README.zh-CN.md)
 
-**An AI Agent benchmark evaluating the performance of (Model × Harness) combinations on production-grade tasks.**
+**PawBench is a production-grade AI Agent benchmark focused on evaluating the joint performance of (Foundation Model × Harness) combinations.**
 
-PawBench is built on the view that agent performance is a property of the `(Model × Harness)` combination. The same set of tasks is run across different `Model × Harness` combinations, so you can see each axis independently and tell whether a bottleneck is **model-limited** (needs a stronger LLM) or **harness-limited** (needs better retries, memory, tool routing, or error recovery).
+As AI moves toward production deployment, the role of the Harness has become increasingly critical, and overall Agent performance is truly a product of both the foundation model and the Harness working in synergy. PawBench breaks away from traditional single-dimension model evaluations by allowing both dimensions to be observed independently. This not only precisely diagnoses whether system bottlenecks are 'model-limited' or 'harness-limited' (such as optimizing retries, context management, tool routing, or error recovery), but also comprehensively evaluates the collaborative synergy of different technical combinations—providing scientific, quantitative guidance for architectural design, component selection, and system optimization, thereby accelerating the full lifecycle iteration of AI Agents.
 
-$$\text{Agent Performance} = f(\text{Model}, \text{Harness})$$
+$$\text{Agent Performance} = f(\text{Foundation Model}, \text{Harness})$$
+
+PawBench v1.0 curates 150 production-grade representative tasks from the community, deeply annotated based on a five-dimensional orthogonal taxonomy (Scenario, Capability, Complexity, Modality, Environment). Together with a secure, container-isolated Docker sandbox, it provides developers with a multi-dimensional, scientifically reproducible Agent comprehensive evaluation capability and leaderboard.
 
 ## Quick Start
 

@@ -24,6 +24,8 @@
   "leaderboard.matrix.title": "Model × Harness Score Matrix",
   "leaderboard.matrix.empty": "No official results yet — values below are placeholders.",
   "leaderboard.matrix.avg": "Avg",
+  "leaderboard.matrix.note": "Note: models tagged \"text-only\" (qwen3.7-max, qwen3.6-max-preview, glm-5.1) don't support multimodal input. Their low scores on multimodal tasks drag down the overall average, so their totals may appear lower than expected.",
+  "leaderboard.matrix.textOnlyBadge": "text-only",
   "leaderboard.col.rank": "#",
   "leaderboard.col.model": "Model",
   "leaderboard.col.harness": "Harness",
@@ -56,7 +58,7 @@
   "slice.bucket.help": "Pick a dimension + 1 value → see model × harness on that subset",
   "slice.pivot.summary": "Model × Harness on \"{bucket}\"",
   "slice.pivot.taskCount": "tasks",
-  "slice.pivot.bestCol": "best",
+  "slice.pivot.avgCol": "avg",
   "slice.noModelData": "Submissions don't include slice scores for this dimension yet.",
 
   "tasks.title": "Task Library",

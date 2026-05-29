@@ -24,6 +24,8 @@
   "leaderboard.matrix.title": "Model × Harness 评分矩阵",
   "leaderboard.matrix.empty": "尚未导入正式评测结果，下方为占位数据。",
   "leaderboard.matrix.avg": "平均",
+  "leaderboard.matrix.note": "注：标记 “纯文本” 的模型（qwen3.7-max、qwen3.6-max-preview、glm-5.1）不支持多模态，多模态任务上的打分偏低会拉低其总分，因此总分可能偏低。",
+  "leaderboard.matrix.textOnlyBadge": "纯文本",
   "leaderboard.col.rank": "#",
   "leaderboard.col.model": "Model",
   "leaderboard.col.harness": "Harness",
@@ -56,7 +58,7 @@
   "slice.bucket.help": "选维度 + 1 个值，看该子集上的 model × harness 表现",
   "slice.pivot.summary": "「{bucket}」上的 model × harness",
   "slice.pivot.taskCount": "个任务",
-  "slice.pivot.bestCol": "best",
+  "slice.pivot.avgCol": "avg",
   "slice.noModelData": "提交结果中尚不包含该维度的切片分数。",
 
   "tasks.title": "任务库",

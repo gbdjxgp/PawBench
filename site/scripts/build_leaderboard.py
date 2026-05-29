@@ -289,10 +289,12 @@ def build_matrix(rows: list[dict[str, Any]]) -> dict[str, Any]:
             v = cells[m][h]
             row[h] = None if v != v else round(v, 4)
         matrix.append(row)
-    matrix.sort(
-        key=lambda r: max((v for v in r.values() if isinstance(v, int | float)), default=0),
-        reverse=True,
-    )
+
+    def _row_avg(row: dict[str, Any]) -> float:
+        vals = [row[h] for h in harnesses if isinstance(row.get(h), int | float)]
+        return sum(vals) / len(vals) if vals else 0.0
+
+    matrix.sort(key=_row_avg, reverse=True)
     return {"models": [r["model"] for r in matrix], "harnesses": harnesses, "rows": matrix}
 
 
