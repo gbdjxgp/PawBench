@@ -42,25 +42,23 @@ jobs:
           python site/scripts/aggregate_results.py
           python site/scripts/build_leaderboard.py
 
+      # npm 10.x / 11.x kept hanging on this lockfile with
+      # "Exit handler never called!" — see prior workflow runs. Switching
+      # the install layer to pnpm avoids that codepath entirely.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
       - uses: actions/setup-node@v4
         with:
-          # Node 22 ships a newer npm with fixes for the "Exit handler never
-          # called!" hang we hit on 20.x during sharp/native postinstall.
           node-version: '22'
-          cache: 'npm'
-          cache-dependency-path: site/package-lock.json
+          cache: 'pnpm'
+          cache-dependency-path: site/pnpm-lock.yaml
 
       - name: Install Node deps
         working-directory: site
-        env:
-          NODE_OPTIONS: --max-old-space-size=4096
         run: |
-          # npm 10.x (bundled with Node 22) hangs and crashes with
-          # "Exit handler never called!" mid-install — a known scheduler bug
-          # that's fixed in npm 11.x. Upgrade before running `npm ci`.
-          npm install -g npm@latest
-          npm --version
-          npm ci --no-audit --no-fund
+          pnpm install --frozen-lockfile
           echo "--- node_modules/.bin/astro check ---"
           ls -la node_modules/.bin/astro
           node_modules/.bin/astro --version
@@ -72,9 +70,9 @@ jobs:
           # Repo was renamed to PawBench on 2026-06; keep BASE case-aligned so
           # canonical Pages URL and in-page asset paths agree.
           PAWBENCH_BASE: /PawBench/
-        # Invoke astro via its installed path rather than via `npm run build`'s
-        # PATH resolution, which has bitten us once with `sh: astro: not found`
-        # even when `npm ci` reported success.
+        # Skip `pnpm exec` here — it runs a deps-status precheck that
+        # bails on the "Ignored build scripts" warning. The astro binary
+        # works fine called directly.
         run: node_modules/.bin/astro build
 
       - uses: actions/configure-pages@v5
