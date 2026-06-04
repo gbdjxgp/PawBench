@@ -80,6 +80,8 @@
   "tasks.filter.complexity": "复杂度",
   "tasks.filter.capability": "能力",
   "tasks.filter.modality": "模态",
+  "tasks.filter.environment": "环境",
+  "tasks.filter.scenario_top": "场景（一级）",
   "tasks.filter.grading": "评分",
   "tasks.filter.reset": "清空筛选",
   "tasks.empty": "没有匹配的任务",

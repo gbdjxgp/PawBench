@@ -80,6 +80,8 @@
   "tasks.filter.complexity": "Complexity",
   "tasks.filter.capability": "Capability",
   "tasks.filter.modality": "Modality",
+  "tasks.filter.environment": "Environment",
+  "tasks.filter.scenario_top": "Scenario (top)",
   "tasks.filter.grading": "Grading",
   "tasks.filter.reset": "Reset",
   "tasks.empty": "No tasks match the current filters.",
