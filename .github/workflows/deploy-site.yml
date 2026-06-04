@@ -50,14 +50,21 @@ jobs:
 
       - name: Install Node deps
         working-directory: site
-        run: npm ci
+        run: |
+          npm ci --no-audit --no-fund
+          echo "--- node_modules/.bin/astro check ---"
+          ls -la node_modules/.bin/astro
+          node_modules/.bin/astro --version
 
       - name: Build Astro site
         working-directory: site
         env:
           PAWBENCH_SITE: https://agentscope-ai.github.io
           PAWBENCH_BASE: /pawbench/
-        run: npm run build
+        # Invoke astro via its installed path rather than via `npm run build`'s
+        # PATH resolution, which has bitten us once with `sh: astro: not found`
+        # even when `npm ci` reported success.
+        run: node_modules/.bin/astro build
 
       - uses: actions/configure-pages@v5
 
