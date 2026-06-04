@@ -38,7 +38,7 @@ $$\text{Agent 表现} = f(\text{LLM}, \text{Harness})$$
 
 v1.0 覆盖 **9 个模型 × 3 个 Harness × 150 道任务**。第一批结果显示，三家 Harness 的平均分最高和最低相差 **5.6 分**，已经接近一些模型版本升级带来的收益。以 `qwen3.6-35b-a3b` 为例，只切换 Harness，分数差距达到 **11.5 分**。
 
-![PawBench 榜单概览](site/public/pawbench-leaderboard-overview.svg)
+![PawBench 榜单概览](site/public/pawbench-leaderboard-overview.png)
 
 ## 快速开始
 
