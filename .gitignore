@@ -29,4 +29,5 @@ results/
 analysis/
 task_analysis/
 attribution/
+uv.lock
 run_batch.sh

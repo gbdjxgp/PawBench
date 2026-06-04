@@ -12,7 +12,8 @@ interface Props {
     complexity: string;
     capability: string;
     modality: string;
-    grading: string;
+    environment: string;
+    scenario_top: string;
     reset: string;
     empty: string;
     count: string;
@@ -32,7 +33,8 @@ type Filters = {
   complexity: string | 'all';
   capability: string | 'all';
   modality: string | 'all';
-  grading: string | 'all';
+  environment: string | 'all';
+  scenario_top: string | 'all';
 };
 
 const initial: Filters = {
@@ -41,7 +43,8 @@ const initial: Filters = {
   complexity: 'all',
   capability: 'all',
   modality: 'all',
-  grading: 'all',
+  environment: 'all',
+  scenario_top: 'all',
 };
 
 export default function TaskExplorer({ tasks, labels }: Props) {
@@ -89,13 +92,16 @@ export default function TaskExplorer({ tasks, labels }: Props) {
     const complexity = new Set<string>();
     const caps = new Set<string>();
     const modalities = new Set<string>();
-    const gradings = new Set<string>();
+    const environments = new Set<string>();
+    const scenarioTops = new Set<string>();
     for (const t of tasks) {
       if (t.source_dataset) sources.add(t.source_dataset);
       if (t.labels?.complexity) complexity.add(t.labels.complexity);
       for (const c of t.labels?.capabilities ?? []) caps.add(c);
       modalities.add(t.labels?.modality?.type || 'text');
-      if (t.grading_type) gradings.add(t.grading_type);
+      if (t.labels?.environment) environments.add(t.labels.environment);
+      const scTop = (t.labels?.scenario || '').split('/', 1)[0];
+      if (scTop) scenarioTops.add(scTop);
     }
     const sortStr = (a: string, b: string) => a.localeCompare(b);
     return {
@@ -103,7 +109,8 @@ export default function TaskExplorer({ tasks, labels }: Props) {
       complexity: [...complexity].sort(sortStr),
       caps: [...caps].sort(sortStr),
       modalities: [...modalities].sort(sortStr),
-      gradings: [...gradings].sort(sortStr),
+      environments: [...environments].sort(sortStr),
+      scenarioTops: [...scenarioTops].sort(sortStr),
     };
   }, [tasks]);
 
@@ -115,7 +122,8 @@ export default function TaskExplorer({ tasks, labels }: Props) {
       if (f.complexity !== 'all' && t.labels?.complexity !== f.complexity) return false;
       if (f.capability !== 'all' && !(t.labels?.capabilities ?? []).includes(f.capability)) return false;
       if (f.modality !== 'all' && (t.labels?.modality?.type || 'text') !== f.modality) return false;
-      if (f.grading !== 'all' && t.grading_type !== f.grading) return false;
+      if (f.environment !== 'all' && t.labels?.environment !== f.environment) return false;
+      if (f.scenario_top !== 'all' && (t.labels?.scenario || '').split('/', 1)[0] !== f.scenario_top) return false;
       return true;
     });
   }, [tasks, f]);
@@ -134,11 +142,12 @@ export default function TaskExplorer({ tasks, labels }: Props) {
               className="w-full px-3 py-2 text-sm rounded-md border border-slate-200 dark:border-slate-700 bg-white dark:bg-slate-900 focus:outline-none focus:ring-2 focus:ring-brand-500"
             />
           </div>
-          <FilterGroup label={labels.source}     value={f.source}     options={opts.sources}    onChange={(v) => setF({ ...f, source: v })} />
-          <FilterGroup label={labels.complexity} value={f.complexity} options={opts.complexity} onChange={(v) => setF({ ...f, complexity: v })} />
-          <FilterGroup label={labels.capability} value={f.capability} options={opts.caps}       onChange={(v) => setF({ ...f, capability: v })} />
-          <FilterGroup label={labels.modality}   value={f.modality}   options={opts.modalities} onChange={(v) => setF({ ...f, modality: v })} />
-          <FilterGroup label={labels.grading}    value={f.grading}    options={opts.gradings}   onChange={(v) => setF({ ...f, grading: v })} />
+          <FilterGroup label={labels.complexity}   value={f.complexity}   options={opts.complexity}    onChange={(v) => setF({ ...f, complexity: v })} />
+          <FilterGroup label={labels.modality}     value={f.modality}     options={opts.modalities}    onChange={(v) => setF({ ...f, modality: v })} />
+          <FilterGroup label={labels.environment}  value={f.environment}  options={opts.environments}  onChange={(v) => setF({ ...f, environment: v })} />
+          <FilterGroup label={labels.capability}   value={f.capability}   options={opts.caps}          onChange={(v) => setF({ ...f, capability: v })} />
+          <FilterGroup label={labels.scenario_top} value={f.scenario_top} options={opts.scenarioTops}  onChange={(v) => setF({ ...f, scenario_top: v })} />
+          <FilterGroup label={labels.source}       value={f.source}       options={opts.sources}       onChange={(v) => setF({ ...f, source: v })} />
           <button
             type="button"
             onClick={() => setF(initial)}
