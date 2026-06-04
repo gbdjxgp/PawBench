@@ -25,7 +25,7 @@
 
 <p align="center">
   <strong>面向通用智能体的评测基准，用来评估 LLM 和 Harness 的联合效果。</strong><br>
-  150 道 Agent 任务 | 4,050 个 model-harness-task cell | 支持分数切片、执行轨迹、grader 产物和可复盘运行。
+  150 道智能体任务 · 9 款模型 · 3 大 Harness · 深度诊断轨迹
 </p>
 
 ---

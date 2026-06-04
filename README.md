@@ -25,7 +25,7 @@
 
 <p align="center">
   <strong>A benchmark for evaluating LLM × harness performance.</strong><br>
-  150 agent tasks | 4,050 model-harness-task cells | score slices, transcripts, grader artifacts, and replayable runs.
+  150 agent tasks · 9 models · 3 harnesses · diagnostic traces
 </p>
 
 ---
