@@ -24,6 +24,9 @@
   <a href="LICENSE">
     <img alt="license" src="https://img.shields.io/badge/license-Apache%202.0-blue">
   </a>
+  <a href="https://github.com/agentscope-ai/OpenJudge">
+    <img alt="OpenJudge Ecosystem" src="https://img.shields.io/badge/ecosystem-OpenJudge-blue?logo=github&color=0969da">
+  </a>
 </p>
 
 <p align="center">
@@ -39,6 +42,8 @@ PawBench evaluates the model and the harness together:
 
 $$\text{Agent Performance} = f(\text{LLM}, \text{Harness})$$
 
+PawBench is part of the [OpenJudge](https://github.com/agentscope-ai/OpenJudge) ecosystem, built by the OpenJudge team. It shares OpenJudge's evaluation philosophy — define graders, run at scale, analyze weaknesses, iterate — and applies it to the specific question of how a model behaves across different agent harnesses.
+
 v1.0 covers **9 models × 3 harnesses × 150 tasks**. Our initial evaluation highlights a key finding:
 
 - **Harness gaps are stable and significant**: The **5.6-point** average gap between the top and bottom harnesses is close to or even exceeds the performance gains typically brought by many model version upgrades (for example, on `qwen3.6-35b-a3b`, the performance gap between different harnesses reaches up to **11.5 points**).
@@ -52,6 +57,9 @@ With PawBench, you can:
 - **Select:** Pick a model × harness setup for text, multimodal, skill, and web-search workloads.
 - **Diagnose:** Compare a harness against the same model set and see which task slices it trails on.
 - **Iterate:** Inspect traces and rerun slices after a fix to check whether the targeted score actually moves.
+
+> **💡 Optimize Your Evaluation Logic with OpenJudge**
+> While PawBench is a specialized benchmark for LLM × Harness performance, you can build and optimize your own custom evaluation pipelines using **[OpenJudge](https://github.com/agentscope-ai/OpenJudge)**. OpenJudge provides 50+ production-ready graders (such as relevance, tool selection, and trajectory quality) to help you evaluate and fine-tune your custom agents.
 
 ## Quick Start
 
@@ -189,4 +197,4 @@ If you use PawBench in your research or project, please cite it as:
 
 ## Acknowledgments
 
-PawBench is built on top of the open-source agent evaluation community, including [Claw-Eval](https://github.com/claw-eval/claw-eval), [QwenClawBench](https://github.com/SKYLENAGE-AI/QwenClawBench), [WildClawBench](https://github.com/InternLM/WildClawBench), [PinchBench](https://github.com/pinchbench/skill), [skillsbench](https://github.com/benchflow-ai/skillsbench), and others.
+PawBench is part of the [OpenJudge](https://github.com/agentscope-ai/OpenJudge) ecosystem, built by the OpenJudge team, and stands on top of the open-source agent evaluation community, including [Claw-Eval](https://github.com/claw-eval/claw-eval), [QwenClawBench](https://github.com/SKYLENAGE-AI/QwenClawBench), [WildClawBench](https://github.com/InternLM/WildClawBench), [PinchBench](https://github.com/pinchbench/skill), [skillsbench](https://github.com/benchflow-ai/skillsbench), and others.
