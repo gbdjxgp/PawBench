@@ -594,11 +594,20 @@ cli()
             "    print(f'[call_agent] ERROR: {e}', flush=True)\n"
             "    sys.exit(1)\n"
             "\n"
-            "# ── 8. Wait for session file ───────────────────────────────────\n"
+            "# ── 8. Wait for session file (with assistant response) ────────────\n"
             "session_file = f'{SESSIONS_DIR}/{USER_ID}_{SESSION_ID}.json'\n"
-            "for _ in range(30):\n"
-            "    if os.path.isfile(session_file) and os.path.getsize(session_file) > 10:\n"
-            "        break\n"
+            "for _ in range(60):\n"
+            "    try:\n"
+            "        if os.path.isfile(session_file) and os.path.getsize(session_file) > 10:\n"
+            "            with open(session_file, encoding='utf-8') as _sf:\n"
+            "                _d = json.load(_sf)\n"
+            "            _mem = _d.get('agent', {}).get('memory', {}).get('content', [])\n"
+            "            _traj = _d.get('agent', {}).get('_model_trajectory', [])\n"
+            "            _has_resp = any((t.get('response') or []) for t in _traj)\n"
+            "            if len(_mem) > 1 or _has_resp:\n"
+            "                break\n"
+            "    except Exception:\n"
+            "        pass\n"
             "    time.sleep(1)\n"
             "if not os.path.isfile(session_file):\n"
             "    print(f'[call_agent] WARNING: session file not found: {session_file}', flush=True)\n"
@@ -626,18 +635,33 @@ cli()
         )
 
     async def _read_session_file(self, environment: BaseEnvironment, session_id: str) -> str:
-        """Return the newest qwenpaw session JSON."""
-        try:
-            ls_result = await environment.execute_command(
-                f"ls -t {_WORKING_DIR}/workspaces/default/sessions/default_*.json"
-                " 2>/dev/null | head -1",
-                timeout=10,
-            )
-            session_path = (ls_result.get("stdout") or "").strip()
-            if session_path and ls_result.get("returncode") == 0:
-                return await environment.read_file(session_path) or ""
-        except Exception:
-            pass
+        """Return the newest qwenpaw session JSON, retrying until assistant response is present."""
+        import asyncio as _asyncio
+        import json as _json
+        for _attempt in range(20):
+            try:
+                ls_result = await environment.execute_command(
+                    f"ls -t {_WORKING_DIR}/workspaces/default/sessions/default_*.json"
+                    " 2>/dev/null | head -1",
+                    timeout=10,
+                )
+                session_path = (ls_result.get("stdout") or "").strip()
+                if session_path and ls_result.get("returncode") == 0:
+                    raw = await environment.read_file(session_path) or ""
+                    if raw:
+                        try:
+                            _d = _json.loads(raw)
+                            _mem = _d.get("agent", {}).get("memory", {}).get("content", [])
+                            _traj = _d.get("agent", {}).get("_model_trajectory", [])
+                            _has_resp = any((t.get("response") or []) for t in _traj)
+                            if len(_mem) > 1 or _has_resp:
+                                return raw
+                        except Exception:
+                            return raw
+            except Exception:
+                pass
+            if _attempt < 19:
+                await _asyncio.sleep(1)
         return ""
 
     # ── post-run hook ─────────────────────────────────────────────────────────
