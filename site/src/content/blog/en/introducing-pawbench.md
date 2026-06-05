@@ -17,6 +17,9 @@ PawBench targets personal-assistant and general-agent scenarios and evaluates tw
 
 Put differently, the model sets the ceiling on what an agent can do; the harness decides whether that ceiling reaches actual tasks. PawBench puts both on the same scorecard.
 
+> [!NOTE]
+> PawBench is part of the [OpenJudge](https://github.com/agentscope-ai/OpenJudge) ecosystem. It shares OpenJudge's philosophy of evaluation-driven optimization, but focuses specifically on the interaction between LLMs and agent harnesses.
+
 <img src="https://intranetproxy.alipay.com/skylark/lark/0/2026/png/151913/1780536751985-fee338de-3de5-431b-9ec2-0b007b519ef6.png" width="612" title="" crop="0,0,1,1" id="ycidF" class="ne-image">
 
 ## How PawBench v1.0 is built
@@ -184,6 +187,9 @@ If you are a harness developer, PawBench is more than a leaderboard. It gives yo
 3. Regression check: after a fix, re-slice and see whether the score actually moves on the problem you targeted.
 
 This kind of evaluation matters more for general-purpose agents than it does for narrow ones. Real users do not stop after one question. They have the agent operate files, call tools, run scripts, read web pages, and chain steps. PawBench tries to break those chains apart so model and harness capability can each be seen, diagnosed, and improved on its own.
+
+> **💡 Optimize Your Evaluation Logic with OpenJudge**
+> To build your own evaluation system beyond the LLM × Harness vertical, you can leverage **[OpenJudge](https://github.com/agentscope-ai/OpenJudge)**'s 50+ production-ready graders (relevance, tool selection, trajectory, etc.) to evaluate and optimize your custom agents.
 
 ## Contributing
 
