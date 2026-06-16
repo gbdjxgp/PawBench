@@ -30,11 +30,8 @@ Quick start
   # Enable verbose output:
   python run_bench.py --model openai/gpt-4o --verbose
 
-  Results are written under
-  ``./results/<YYYYMMDD_HHMMSS>/pawbench/<model>/<agent>/``
-  so all agents/models from the same invocation share a single run folder and repeated runs do not
-  overwrite each other. Use ``--no-results-version-path`` to omit the timestamp prefix (re-runs
-  overwrite previous results).
+  Results are written directly under ``--results-dir``. Use a unique
+  results directory for each run.
 
 Environment variables
 ---------------------
@@ -420,8 +417,6 @@ async def main() -> int:
     base_results_dir = Path(args.results_dir)
     agents = args.agents or ["qwenpaw"]
 
-    run_ts = _run_timestamp()
-
     # Build full run matrix: models × agents
     run_matrix = [
         (model, api_key, base_url, agent)
@@ -431,13 +426,7 @@ async def main() -> int:
     total = len(run_matrix)
 
     for idx, (model, api_key, base_url, agent_label) in enumerate(run_matrix, start=1):
-        model_label = _filesystem_model_label(model or "default")
-        if args.no_results_version_path:
-            run_results_dir = base_results_dir / _BENCHMARK_NAME / model_label / agent_label
-        else:
-            run_results_dir = (
-                base_results_dir / run_ts / _BENCHMARK_NAME / model_label / agent_label
-            )
+        run_results_dir = base_results_dir
         run_results_dir.mkdir(parents=True, exist_ok=True)
 
         print("\n" + "─" * 80)
